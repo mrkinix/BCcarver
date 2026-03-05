@@ -9,6 +9,8 @@
 ## Overview
 
 ![alt text](https://raw.githubusercontent.com/mrkinix/BCcarver/refs/heads/main/bcc1.PNG)
+> The above simulation was ran using the algorithm in python, rust values were faster;
+
 
 Ben Chiboub Carver (BCC) is an independently developed algorithm for detecting and constructing Hamiltonian cycles in undirected graphs. It uses constraint propagation, backtracking, and heuristic branching to efficiently search for cycles. Key features include proactive edge locking/deleting rules, UNSAT filters (e.g., bipartite parity, bridges, articulation points), and memoization for state caching.
 
