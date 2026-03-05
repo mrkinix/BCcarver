@@ -1,10 +1,7 @@
 ## README.md
 
 # Ben Chiboub Carver (BCC): A Proactive Constraint Solver for Hamiltonian Cycles
-
-**Author:** Hédi Ben Chiboub  
-**Date:** March 05, 2026  
-**License:** GNU v3
+  
 
 ## Overview
 
@@ -12,7 +9,7 @@
 > The above simulation was ran using the algorithm in python, rust values were faster;
 
 
-Ben Chiboub Carver (BCC) is an independently developed algorithm for detecting and constructing Hamiltonian cycles in undirected graphs. It uses constraint propagation, backtracking, and heuristic branching to efficiently search for cycles. Key features include proactive edge locking/deleting rules, UNSAT filters (e.g., bipartite parity, bridges, articulation points), and memoization for state caching.
+Ben Chiboub Carver (BCC) is an implementation for detecting and constructing Hamiltonian cycles in undirected graphs. It uses constraint propagation, backtracking, and heuristic branching to efficiently search for cycles. Key features include proactive edge locking/deleting rules, UNSAT filters (e.g., bipartite parity, bridges, articulation points), and memoization for state caching.
 
 This Rust implementation includes:
 - The core solver (`BcCraver` struct).
