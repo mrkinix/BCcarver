@@ -12,7 +12,7 @@ struct BcCraver {
     n: usize,
     nodes: Vec<usize>,
     g_orig: Vec<Vec<usize>>,
-    memo_cache: HashSet<String>,
+    memo_cache: HashSet<Vec<u64>>,
     best_path: Option<Vec<Edge>>,
     all_edges: Vec<Edge>,
     edge_id: HashMap<Edge, usize>,
@@ -49,19 +49,28 @@ impl BcCraver {
         }
     }
 
-    fn _get_state_hash(&self, locked: &HashSet<Edge>, deleted: &HashSet<Edge>) -> String {
-        let mut state = vec!['U'; self.all_edges.len()];
+    fn _get_state_key(&self, locked: &HashSet<Edge>, deleted: &HashSet<Edge>) -> Vec<u64> {
+        let m = self.all_edges.len();
+        let num_bits = m * 2;
+        let num_words = (num_bits + 63) / 64;
+        let mut key = vec![0u64; num_words];
         for e in locked {
             if let Some(&id) = self.edge_id.get(e) {
-                state[id] = 'L';
+                let bit_pos = id * 2;
+                let word = bit_pos / 64;
+                let bit = bit_pos % 64;
+                key[word] |= 1u64 << bit;
             }
         }
         for e in deleted {
             if let Some(&id) = self.edge_id.get(e) {
-                state[id] = 'D';
+                let bit_pos = id * 2 + 1;
+                let word = bit_pos / 64;
+                let bit = bit_pos % 64;
+                key[word] |= 1u64 << bit;
             }
         }
-        state.into_iter().collect()
+        key
     }
 
     fn solve(&mut self) -> Option<Vec<Edge>> {
@@ -89,24 +98,28 @@ impl BcCraver {
     }
 
     fn _search(&mut self, locked: &mut HashSet<Edge>, deleted: &mut HashSet<Edge>) -> bool {
-        let state_sig = self._get_state_hash(locked, deleted);
+        let state_sig = self._get_state_key(locked, deleted);
         if self.memo_cache.contains(&state_sig) {
             return false;
         }
+
+        let mut g_avail = self.g_orig.clone();
+        for e in deleted.iter() {
+            let u = e.0;
+            let v = e.1;
+            g_avail[u].retain(|&x| x != v);
+            g_avail[v].retain(|&x| x != u);
+        }
+
         let mut changed = true;
         while changed {
             changed = false;
-            let mut g_avail = self.g_orig.clone();
-            for e in deleted.iter() {
-                let u = e.0;
-                let v = e.1;
-                g_avail[u].retain(|&x| x != v);
-                g_avail[v].retain(|&x| x != u);
-            }
-            if !self.is_connected(&g_avail) {
+
+            if g_avail.iter().any(|adj| adj.len() < 2) {
                 self.memo_cache.insert(state_sig.clone());
                 return false;
             }
+
             let aps = self.get_articulation_points(&g_avail);
             for ap in aps {
                 let mut g_temp = g_avail.clone();
@@ -116,10 +129,8 @@ impl BcCraver {
                     return false;
                 }
             }
-            let mut degree: Vec<usize> = vec![0; self.n];
-            for i in 0..self.n {
-                degree[i] = g_avail[i].len();
-            }
+
+            let degree: Vec<usize> = g_avail.iter().map(|adj| adj.len()).collect();
             let mut locked_degree: Vec<usize> = vec![0; self.n];
             for e in locked.iter() {
                 locked_degree[e.0] += 1;
@@ -130,8 +141,23 @@ impl BcCraver {
                 self.memo_cache.insert(state_sig.clone());
                 return false;
             }
+
+            let mut locket_count: Vec<usize> = vec![0; self.n];
+            for i in 0..self.n {
+                if degree[i] == 2 {
+                    for &v in &g_avail[i] {
+                        locket_count[v] += 1;
+                    }
+                }
+            }
+            if locket_count.iter().any(|&c| c > 2) {
+                self.memo_cache.insert(state_sig.clone());
+                return false;
+            }
+
             for &node in &self.nodes {
                 let avail_edges = g_avail[node].clone();
+
                 if avail_edges.len() == 2 && locked_degree[node] < 2 {
                     for &v in &avail_edges {
                         let e = Edge(min(node, v), max(node, v));
@@ -140,17 +166,45 @@ impl BcCraver {
                             changed = true;
                         }
                     }
-                }
-                if locked_degree[node] == 2 && avail_edges.len() > 2 {
-                    for &v in &avail_edges {
-                        let e = Edge(min(node, v), max(node, v));
-                        if !locked.contains(&e) && !deleted.contains(&e) {
-                            deleted.insert(e);
-                            changed = true;
+                    if avail_edges.len() == 2 {
+                        let m1 = avail_edges[0];
+                        let m2 = avail_edges[1];
+                        if m1 != m2 {
+                            let has_chord = g_avail[m1].iter().any(|&x| x == m2);
+                            if has_chord {
+                                let e_chord = Edge(min(m1, m2), max(m1, m2));
+                                if !locked.contains(&e_chord) && !deleted.contains(&e_chord) {
+                                    deleted.insert(e_chord);
+                                    changed = true;
+                                    let u = e_chord.0;
+                                    let vv = e_chord.1;
+                                    g_avail[u].retain(|&x| x != vv);
+                                    g_avail[vv].retain(|&x| x != u);
+                                }
+                            }
                         }
                     }
                 }
+
+                if locked_degree[node] == 2 && g_avail[node].len() > 2 {
+                    let current_neighbors: Vec<usize> = g_avail[node].clone();
+                    let mut to_delete = vec![];
+                    for &v in &current_neighbors {
+                        let e = Edge(min(node, v), max(node, v));
+                        if !locked.contains(&e) {
+                            to_delete.push(v);
+                        }
+                    }
+                    for &v in &to_delete {
+                        let e = Edge(min(node, v), max(node, v));
+                        deleted.insert(e);
+                        changed = true;
+                        g_avail[node].retain(|&x| x != v);
+                        g_avail[v].retain(|&x| x != node);
+                    }
+                }
             }
+
             if !locked.is_empty() {
                 let mut g_locked: Vec<Vec<usize>> = vec![vec![]; self.n];
                 for e in locked.iter() {
@@ -168,6 +222,7 @@ impl BcCraver {
                 }
             }
         }
+
         if locked.len() == self.n {
             let mut g_locked: Vec<Vec<usize>> = vec![vec![]; self.n];
             for e in locked.iter() {
@@ -180,27 +235,47 @@ impl BcCraver {
                 return true;
             }
         }
+
         let mut locked_degree = vec![0usize; self.n];
         for e in locked.iter() {
             locked_degree[e.0] += 1;
             locked_degree[e.1] += 1;
         }
+        let avail_deg: Vec<usize> = g_avail.iter().map(|adj| adj.len()).collect();
+
         let mut available_edges: Vec<Edge> = vec![];
-        for &e in &self.all_edges {
-            if !locked.contains(&e) && !deleted.contains(&e) {
-                available_edges.push(e);
+        for u in 0..self.n {
+            for &v in &g_avail[u] {
+                if u < v {
+                    let e = Edge(u, v);
+                    if !locked.contains(&e) {
+                        available_edges.push(e);
+                    }
+                }
             }
         }
+
         if available_edges.is_empty() {
             self.memo_cache.insert(state_sig.clone());
             return false;
         }
-        available_edges.sort_by(|a, b| {
-            let sum_a = locked_degree[a.0] + locked_degree[a.1];
-            let sum_b = locked_degree[b.0] + locked_degree[b.1];
-            sum_b.cmp(&sum_a)
+
+        available_edges.sort_by(|ea, eb| {
+            let (u1, v1) = (ea.0, ea.1);
+            let (u2, v2) = (eb.0, eb.1);
+            let sum1 = locked_degree[u1] + locked_degree[v1];
+            let sum2 = locked_degree[u2] + locked_degree[v2];
+            let force1 = (if locked_degree[u1] == 1 { avail_deg[u1].saturating_sub(2) } else { 0 })
+                + (if locked_degree[v1] == 1 { avail_deg[v1].saturating_sub(2) } else { 0 });
+            let force2 = (if locked_degree[u2] == 1 { avail_deg[u2].saturating_sub(2) } else { 0 })
+                + (if locked_degree[v2] == 1 { avail_deg[v2].saturating_sub(2) } else { 0 });
+            let score1 = (sum1 as u32) * 100 + (force1 as u32);
+            let score2 = (sum2 as u32) * 100 + (force2 as u32);
+            score2.cmp(&score1)
         });
+
         let guess_edge = available_edges[0];
+
         {
             let mut locked1 = locked.clone();
             locked1.insert(guess_edge);
@@ -211,6 +286,7 @@ impl BcCraver {
                 return true;
             }
         }
+
         {
             let mut locked2 = locked.clone();
             let mut deleted2 = deleted.clone();
@@ -221,6 +297,7 @@ impl BcCraver {
                 return true;
             }
         }
+
         self.memo_cache.insert(state_sig);
         false
     }
@@ -474,8 +551,6 @@ fn dfs(u: usize, g: &Vec<Vec<usize>>, visited: &mut Vec<bool>) {
     }
 }
 
-// Graph generators
-
 fn get_tutte_graph() -> Vec<Vec<usize>> {
     let n = 46;
     let mut g: Vec<Vec<usize>> = vec![vec![]; n];
@@ -534,7 +609,7 @@ fn get_desargues_graph() -> Vec<Vec<usize>> {
 fn get_dodecahedral_graph() -> Vec<Vec<usize>> {
     let n = 20;
     let mut g: Vec<Vec<usize>> = vec![vec![]; n];
-    let adjs = vec![1,4,7, 0,2,9, 1,3,11, 2,4,13, 0,3,5, 4,6,14, 5,7,16, 0,6,8, 7,9,17, 1,8,10, 9,11,18, 2,10,12, 11,13,19, 3,12,14, 5,13,15, 14,16,19, 6,15,17, 8,16,18, 10,17,19, 12,15,18];
+    let adjs = vec![1,4,7, 0,2,9, 1,3,11, 2,3,13, 0,3,5, 4,6,14, 5,7,16, 0,6,8, 7,9,17, 1,8,10, 9,11,18, 2,10,12, 11,13,19, 3,12,14, 5,13,15, 14,16,19, 6,15,17, 8,16,18, 10,17,19, 12,15,18];
     for i in 0..20 {
         for j in 0..3 {
             let v = adjs[i * 3 + j];
@@ -644,7 +719,6 @@ fn get_star_graph(k: usize) -> Vec<Vec<usize>> {
 }
 
 fn get_barbell_graph(m1: usize, _m2: usize) -> Vec<Vec<usize>> {
-    // m2 = 0
     let nn = 2 * m1;
     let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
     for i in 0..m1 {
@@ -683,8 +757,8 @@ fn verify_carver_integrity() {
         ("7x7 Grid (UNSAT)".to_string(), || get_grid_graph(7, 7), "UNSAT".to_string()),
         ("Barbell B(8,0) (UNSAT)".to_string(), || get_barbell_graph(8, 0), "UNSAT".to_string()),
     ];
-    for (name, gen, expected) in test_matrix {
-        let g = gen();
+    for (name, maker, expected) in test_matrix {
+        let g = maker();
         let n = g.len();
         let mut solver = BcCraver::new(&g);
         let start = Instant::now();
@@ -725,8 +799,8 @@ fn run_bulletproof_audit(max_n: usize) {
         let mut edges_num = 0;
         let mut status = String::new();
         for _ in 0..3 {
-            let p_hard = ( (nn as f64).ln() + ((nn as f64).ln().ln() + 1e-9) ) / (nn as f64);
-            let p_test = p_hard.max(0.15);
+            let p_hard = ((nn as f64).ln() + ((nn as f64).ln().ln() + 1e-9)) / (nn as f64);
+            let p_test = p_hard;
             let mut g = get_random_graph(nn, p_test);
             while !is_connected(&g, nn) {
                 g = get_random_graph(nn, p_test);
@@ -743,10 +817,9 @@ fn run_bulletproof_audit(max_n: usize) {
         let avg_t = trial_times.iter().sum::<f64>() / 3.0;
         println!("{:<5} | {:<7} | {:.5}     | {:<12} | {}", nn, edges_num, avg_t, cache_size, status);
     }
-    // Fit omitted
 }
 
 fn main() {
     verify_carver_integrity();
-    run_bulletproof_audit(210);
+    run_bulletproof_audit(200000);
 }
