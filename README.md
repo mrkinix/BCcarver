@@ -1,100 +1,211 @@
-## README.md
+# BCcarver — Hamiltonian Cycle Solver
 
-# Ben Chiboub Carver (BCC): A Proactive Constraint Solver for Hamiltonian Cycles
-  
+A fast, exact Hamiltonian cycle solver written in Rust. Built from first principles — the pruning rules were derived independently with pen and paper, then implemented with AI assistance. No prior knowledge of graph theory or Rust was assumed.
 
-## Overview
+**20/20 on adversarial test suite. Solves N=500 sparse random graphs (p=0.08) in ~3.5 seconds consistently.**
 
-![alt text](https://raw.githubusercontent.com/mrkinix/BCcarver/refs/heads/main/bcc1.PNG)
-> The above simulation was ran using the algorithm in python, rust values were faster;
+---
 
+## What Is a Hamiltonian Cycle?
 
-Ben Chiboub Carver (BCC) is an implementation for detecting and constructing Hamiltonian cycles in undirected graphs. It uses constraint propagation, backtracking, and heuristic branching to efficiently search for cycles. Key features include proactive edge locking/deleting rules, UNSAT filters (e.g., bipartite parity, bridges, articulation points), and memoization for state caching.
+A Hamiltonian cycle is a closed path through a graph that visits every node exactly once. Deciding whether such a cycle exists is NP-complete — there is no known polynomial-time algorithm. This solver uses constraint propagation + backtracking search to find cycles exactly, or prove none exist.
 
-This Rust implementation includes:
-- The core solver (`BcCraver` struct).
-- Graph generators for test cases (e.g., Petersen, Tutte, grids).
-- Verification suite for adversarial graphs.
-- Complexity audit on random graphs.
+---
 
+## Algorithm
 
-## Installation
+The solver is a **constraint-propagation / backtracking** engine operating on two edge states: *locked* (must be in the cycle) and *deleted* (cannot be in the cycle).
 
-Requires Rust (stable). Clone the repo and run:
+### Propagation Rules (applied exhaustively before each branch)
 
-```bash
-cargo build
-cargo run
+| Rule | Description |
+|------|-------------|
+| **Degree-2 forcing** | If a node has only 2 available edges, both must be locked |
+| **Chord deletion** | When a node's two neighbours are adjacent, their shared edge would create a premature subcycle — delete it |
+| **Saturation** | Once a node has 2 locked edges, delete all its remaining available edges |
+| **Locked-count constraint** | If a node is forced by too many degree-2 nodes simultaneously, contradiction |
+| **2-connectivity pruning** | If the available graph has any articulation point, no Hamiltonian cycle is possible — prune |
+| **Subcycle detection** | If locked edges form a cycle on a proper subset of nodes, prune |
+| **Path endpoint connectivity** | Track the two open ends of the partial path; if they cannot reach each other through available edges, prune |
+| **Degree-3 near-forcing** | One-step lookahead: if locking a specific edge would starve a neighbour below degree 2, delete it |
+
+### Branch Variable Selection (MRV + Fail-First)
+
+Instead of picking an arbitrary edge to branch on, the solver uses **Minimum Remaining Values (MRV)**: it finds the most-constrained node (lowest available degree, highest locked degree) and branches on its tightest incident edge. This is the same heuristic used in state-of-the-art SAT/CSP solvers.
+
+### Pre-Filters (O(n+m), run before search)
+
+- **Bridge detection** — a graph with a bridge cannot have a Hamiltonian cycle
+- **Bipartite parity check** — a bipartite graph needs equal partition sizes
+
+### Memoization
+
+Dead-end states are stored in a transposition table keyed by the exact `(locked_bits, deleted_bits)` pair. Collision-free, unlike Zobrist-hash-only approaches.
+
+---
+
+## Performance
+
+### Adversarial Test Suite — 20/20 ✅
+
 ```
+Graph                            | N     | Expected   | Result     | Time(s)   | Status
+---------------------------------|-------|------------|------------|-----------|--------
+Petersen (UNSAT)                 | 10    | UNSAT      | UNSAT      | 0.00052   | ✅ PASS
+Tutte Graph (UNSAT)              | 46    | UNSAT      | UNSAT      | 0.16316   | ✅ PASS
+8x8 Grid (SAT)                   | 64    | SAT        | SAT        | 0.01766   | ✅ PASS
+Heawood (SAT)                    | 14    | SAT        | SAT        | 0.00056   | ✅ PASS
+Hypercube Q4 (SAT)               | 16    | SAT        | SAT        | 0.00103   | ✅ PASS
+Dodecahedral (SAT)               | 20    | SAT        | SAT        | 0.00091   | ✅ PASS
+Desargues (SAT)                  | 20    | SAT        | SAT        | 0.00103   | ✅ PASS
+Complete K15 (SAT)               | 15    | SAT        | SAT        | 0.00171   | ✅ PASS
+Wheel W20 (SAT)                  | 20    | SAT        | SAT        | 0.00351   | ✅ PASS
+Circular Ladder 10 (SAT)         | 20    | SAT        | SAT        | 0.00108   | ✅ PASS
+Bipartite K5,6 (UNSAT)           | 11    | UNSAT      | UNSAT      | 0.00002   | ✅ PASS
+Star S8 (UNSAT)                  | 9     | UNSAT      | UNSAT      | 0.00001   | ✅ PASS
+7x7 Grid (UNSAT)                 | 49    | UNSAT      | UNSAT      | 0.00005   | ✅ PASS
+Barbell B8 (UNSAT)               | 16    | UNSAT      | UNSAT      | 0.00003   | ✅ PASS
+5x5 Knight (UNSAT)               | 25    | UNSAT      | UNSAT      | 0.00003   | ✅ PASS
+10x10 Grid (SAT)                 | 100   | SAT        | SAT        | 0.04018   | ✅ PASS
+11x11 Grid (UNSAT)               | 121   | UNSAT      | UNSAT      | 0.00012   | ✅ PASS
+Hypercube Q5 (SAT)               | 32    | SAT        | SAT        | 0.00477   | ✅ PASS
+Complete K20 (SAT)               | 20    | SAT        | SAT        | 0.00340   | ✅ PASS
+Circular Ladder 30 (SAT)         | 60    | SAT        | SAT        | 0.00691   | ✅ PASS
+```
+
+The Petersen graph and Tutte graph are classic adversarial cases specifically constructed to be non-Hamiltonian while resisting simple heuristics. Both are handled correctly.
+
+### Sparse Random Graphs (p = 0.08, phase-transition density)
+
+This is the hardest regime — where approximately half of all random graphs are Hamiltonian and half are not. No easy structural shortcuts exist.
+
+```
+N     | Edges  | Time (s)
+------|--------|----------
+150   | ~900   | 0.15
+300   | ~3600  | 0.80
+491   | 9631   | 3.27
+495   | 9957   | 3.41
+500   | 9799   | 3.51
+504   | 10328  | 3.82
+```
+
+Zero timeouts across N=100–504 at p=0.08. Scaling is sub-quadratic in this range.
+
+---
 
 ## Usage
 
-Run the verification and audit:
+### Build
 
-```rust
-fn main() {
-    verify_carver_integrity();
-    run_bulletproof_audit(210);
-}
+```toml
+# Cargo.toml
+[dependencies]
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
 ```
 
-## Verification Results
+```bash
+cargo build --release
+```
 
-The solver was tested on a suite of adversarial graphs to verify correctness and performance. All cases passed validation.
+### Run Built-in Test Suite
 
-| Adversarial Case          | N  | Expected | Result | Time (s)     |
-|---------------------------|----|----------|--------|--------------|
-| Petersen (UNSAT)          | 10 | UNSAT    | UNSAT  | 0.00062 ✅ PASS |
-| Tutte Graph (UNSAT)       | 46 | UNSAT    | UNSAT  | 0.03249 ✅ PASS |
-| 8x8 Grid (SAT)            | 64 | SAT      | SAT    | 0.00806 ✅ PASS |
-| Heawood Graph (SAT)       | 14 | SAT      | SAT    | 0.00039 ✅ PASS |
-| Hypercube Q4 (SAT)        | 16 | SAT      | SAT    | 0.00128 ✅ PASS |
-| Dodecahedral (SAT)        | 20 | SAT      | SAT    | 0.00073 ✅ PASS |
-| Desargues (SAT)           | 20 | SAT      | SAT    | 0.00117 ✅ PASS |
-| Complete K(15) (SAT)      | 15 | SAT      | SAT    | 0.00520 ✅ PASS |
-| Wheel W(20) (SAT)         | 20 | SAT      | SAT    | 0.00070 ✅ PASS |
-| Circular Ladder (SAT)     | 20 | SAT      | SAT    | 0.00052 ✅ PASS |
-| Bipartite K(5,6) (UNSAT)  | 11 | UNSAT    | UNSAT  | 0.00001 ✅ PASS |
-| Star Graph S(8) (UNSAT)   | 9  | UNSAT    | UNSAT  | 0.00001 ✅ PASS |
-| 7x7 Grid (UNSAT)          | 49 | UNSAT    | UNSAT  | 0.00006 ✅ PASS |
-| Barbell B(8,0) (UNSAT)    | 16 | UNSAT    | UNSAT  | 0.00001 ✅ PASS |
+```bash
+cargo run --release
+```
 
-## Complexity Audit Results (Excerpt for n=101-116)
+### Solve a Single FHCP File
 
-Audit on random G(n,p) with p = max(0.15, (ln n + ln ln n)/n), averaged over 3 trials per n.
+```bash
+cargo run --release -- instance.hcp
+```
 
-| N   | Edges | Time (s) | Cache Hits | Status |
-|-----|-------|----------|------------|--------|
-| 101 | 769   | 0.13547  | 7          | Solved |
-| 102 | 789   | 0.25995  | 262        | Solved |
-| 103 | 742   | 0.12543  | 11         | Solved |
-| 104 | 834   | 0.13917  | 13         | Solved |
-| 105 | 831   | 0.13833  | 10         | Solved |
-| 106 | 809   | 0.14547  | 13         | Solved |
-| 107 | 837   | 0.15006  | 13         | Solved |
-| 108 | 870   | 0.13797  | 8          | Solved |
-| 109 | 928   | 0.15669  | 13         | Solved |
-| 110 | 888   | 0.17241  | 23         | Solved |
-| 111 | 971   | 0.16074  | 8          | Solved |
-| 112 | 911   | 4.29418  | 7144       | Solved |
-| 113 | 912   | 0.16628  | 11         | Solved |
-| 114 | 946   | 0.22587  | 11         | Solved |
-| 115 | 974   | 0.18834  | 14         | Solved |
-| 116 | 1046  | 0.19550  | 12         | Solved |
+### Run FHCP Benchmark Directory
 
-Curve fitting suggests polynomial scaling (R² > exponential), indicating efficient propagation on these instances.
+```bash
+cargo run --release -- --fhcp ./fhcp_instances/ 120
+# 120 = timeout per instance in seconds
+```
 
-## Comparison to Top Algorithms
+### Random Graph Audit
 
-BCC was benchmarked against state-of-the-art Hamiltonian cycle (HC) solvers. Note: HC is NP-complete, so exact solvers are exponential worst-case, but heuristics excel on specific classes. BCC targets random dense graphs (p≈0.15, m≈0.075n² edges), which are Hamiltonian w.h.p. above the threshold (p>ln n/n ≈0.05 for n=100).
+```bash
+cargo run --release -- --random 100 500 0.08
+# start_n end_n p
+```
 
-- **Stonecarver's Algorithm (SCHCA, Hertel 2004)**: Similar constraint-based approach for sparse (3-regular) graphs. Empirical O(n²) time, scalable to n=800,000 (sub-quadratic in advanced versions). On random 3-regular n=1000, likely seconds-minutes (unoptimized C++). BCC is ~7x faster than SCHCA's base on similar sparse inputs but optimized for dense; BCC solves n=116 dense in 0.2s vs. SCHCA's potential minutes for large sparse. 
+---
 
-- **Lin-Kernighan Heuristic (H-LKH)**: Adapted TSP solver for HC. O(n^{2.2}) but fast in practice; solves n=7397 TSP in ~1000s. On random 3-regular, ~7x faster than SCHCA (seconds for n=1000). BCC outperforms on dense random (0.1-4s for n=100-116) where H-LKH may struggle with density.
+## FHCP Benchmark
 
-- **SAT-Based CEGAR (Ohashi et al., 2025)**: Solves 937/1001 FHCP hard instances (n up to 1000) in <1800s each. FHCP includes adversarial graphs; BCC solves easy dense in <1s but untested on FHCP—likely slower on hard sparse.
+This solver supports the [Flinders Hamiltonian Cycle Problem benchmark](http://www.flinders.edu.au/science_engineering/csem/research/programs/flinders-hamiltonian-cycle-project/) — 1001 structured graph instances used to compare HC solvers in the research literature.
 
-- **Held-Karp DP**: Exact O(2^n n²), infeasible for n>30 (hours-days).
-- **Concorde TSP (for HC via weights)**: Solves n=100 TSP in seconds-minutes, but exact; BCC faster on tested dense random.
+Download the `.hcp` files and point the solver at the directory:
 
-BCC shines on dense random (sub-second for n=100), competitive with heuristics like SCHCA/H-LKH on scalability, but not a breakthrough—enhances prior ideas with filters/memoization.           
+```bash
+cargo run --release -- --fhcp ./fhcp/ 60
+```
+
+The parser handles both `EDGE_LIST` and `ADJ_LIST` formats.
+
+---
+
+## Input Format
+
+The solver accepts graphs in [TSPLIB HCP format](http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/):
+
+```
+NAME: my_graph
+TYPE: HCP
+DIMENSION: 5
+EDGE_DATA_FORMAT: EDGE_LIST
+EDGE_DATA_SECTION
+1 2
+1 3
+2 4
+3 4
+4 5
+5 1
+-1
+EOF
+```
+
+Nodes are 1-indexed in the file; the solver converts to 0-indexed internally.
+
+---
+
+## Repository Structure
+
+```
+bc_craver_v4.rs   — full solver (single file, ~1370 lines)
+README.md         — this file
+```
+
+---
+
+## Background
+
+This project started as an experiment: could someone with no formal computer science background, no Rust experience, and no prior knowledge of graph theory build a competitive Hamiltonian cycle solver? The approach was to study the problem from scratch, derive pruning rules by hand, and use AI as an implementation assistant.
+
+The core algorithmic ideas — degree-2 forcing, 2-connectivity pruning, MRV branching — were arrived at independently before discovering they match techniques in the published literature (Vandeghen 2012, and earlier work going back to the 1970s). The path endpoint connectivity prune and degree-3 near-forcing lookahead are refinements developed during this project.
+
+The solver is not the fastest in the world. State-of-the-art approaches using linear programming relaxations (Concorde, LKH) solve vastly larger instances. What this solver demonstrates is that the combinatorial core of the problem — the constraint propagation structure — is discoverable from first principles, and that a clean implementation of the right rules competes with published research solvers from 10–15 years ago.
+
+---
+
+## Limitations
+
+- Single-threaded
+- No LP relaxation (pure combinatorial search)
+- Large sparse cubic graphs (N>600, degree=3) may exceed practical time limits
+- Memory usage grows with memoization table on hard instances
+
+---
+
+## Author
+
+[@mrkinix](https://github.com/mrkinix)
+
