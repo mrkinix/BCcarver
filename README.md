@@ -281,4 +281,4 @@ The name **BCcarver** reflects the idea of carving the solution space down with 
 **Hédi Ben Chiboub**  
 GitHub: https://github.com/mrkinix
 
-CS dropout. First Rust project. First graph theory project. Built an exact solver for an NP-complete problem using intuition, experimentation, and persistence.
+Built an exact solver for an NP-complete problem using intuition, experimentation, and persistence.
