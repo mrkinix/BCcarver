@@ -177,26 +177,13 @@ Nodes are 1-indexed in the file; the solver converts to 0-indexed internally.
 
 ---
 
-## Repository Structure
-
-```
-bc_craver_v4.rs   — full solver (single file, ~1370 lines)
-README.md         — this file
-```
-
----
-
 ## Background
 
-This project started as an experiment: could someone with no formal computer science background, no Rust experience, and no prior knowledge of graph theory build a competitive Hamiltonian cycle solver? The approach was to study the problem from scratch, derive pruning rules by hand, and use AI as an implementation assistant.
-
-The core algorithmic ideas — degree-2 forcing, 2-connectivity pruning, MRV branching — were arrived at independently before discovering they match techniques in the published literature (Vandeghen 2012, and earlier work going back to the 1970s). The path endpoint connectivity prune and degree-3 near-forcing lookahead are refinements developed during this project.
-
-The solver is not the fastest in the world. State-of-the-art approaches using linear programming relaxations (Concorde, LKH) solve vastly larger instances. What this solver demonstrates is that the combinatorial core of the problem — the constraint propagation structure — is discoverable from first principles, and that a clean implementation of the right rules competes with published research solvers from 10–15 years ago.
+// to be added.
 
 ---
 
-## Limitations
+## Limitations (working on it)
 
 - Single-threaded
 - No LP relaxation (pure combinatorial search)
