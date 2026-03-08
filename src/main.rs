@@ -7,24 +7,38 @@ use std::cmp::{max, min};
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 struct Edge(usize, usize);
 
+#[derive(Copy, Clone)]
+enum Change {
+    Lock(usize),
+    Delete(usize),
+}
+
 #[derive(Clone)]
 struct BcCraver {
     n: usize,
     nodes: Vec<usize>,
     g_orig: Vec<Vec<usize>>,
-    memo_cache: HashSet<Vec<u64>>,
+    memo_cache: HashMap<u64, Vec<(Vec<u64>, Vec<u64>)>>,
     best_path: Option<Vec<Edge>>,
     all_edges: Vec<Edge>,
     edge_id: HashMap<Edge, usize>,
+    locked_bits: Vec<u64>,
+    deleted_bits: Vec<u64>,
+    current_hash: u64,
+    undo_stack: Vec<Change>,
+    graph_undo: Vec<(usize, usize)>,
+    locked_degree: Vec<usize>,
+    zobrist_lock: Vec<u64>,
+    zobrist_delete: Vec<u64>,
+    g_avail: Vec<Vec<usize>>,
+    total_deletions: usize,
 }
 
 impl BcCraver {
     fn new(g: &Vec<Vec<usize>>) -> Self {
         let n = g.len();
-        let mut nodes = vec![];
-        for i in 0..n {
-            nodes.push(i);
-        }
+        let nodes: Vec<usize> = (0..n).collect();
+
         let mut edge_set: HashSet<Edge> = HashSet::new();
         for u in 0..n {
             for &v in &g[u] {
@@ -38,39 +52,141 @@ impl BcCraver {
         for (i, &e) in all_edges.iter().enumerate() {
             edge_id.insert(e, i);
         }
+        let m = all_edges.len();
+        let num_words = (m * 2 + 63) / 64;
+
+        let mut rng = thread_rng();
+        let mut zobrist_lock = vec![0u64; m];
+        let mut zobrist_delete = vec![0u64; m];
+        for i in 0..m {
+            zobrist_lock[i] = rng.r#gen::<u64>();
+            zobrist_delete[i] = rng.r#gen::<u64>();
+        }
+
         BcCraver {
             n,
             nodes,
             g_orig: g.clone(),
-            memo_cache: HashSet::new(),
+            memo_cache: HashMap::new(),
             best_path: None,
             all_edges,
             edge_id,
+            locked_bits: vec![0u64; num_words],
+            deleted_bits: vec![0u64; num_words],
+            current_hash: 0,
+            undo_stack: vec![],
+            graph_undo: vec![],
+            locked_degree: vec![0; n],
+            zobrist_lock,
+            zobrist_delete,
+            g_avail: g.clone(),
+            total_deletions: 0,
         }
     }
 
-    fn _get_state_key(&self, locked: &HashSet<Edge>, deleted: &HashSet<Edge>) -> Vec<u64> {
+    fn is_locked(&self, id: usize) -> bool {
+        let word = (id * 2) / 64;
+        let bit = (id * 2) % 64;
+        (self.locked_bits[word] & (1u64 << bit)) != 0
+    }
+
+    fn is_deleted(&self, id: usize) -> bool {
+        let word = (id * 2 + 1) / 64;
+        let bit = (id * 2 + 1) % 64;
+        (self.deleted_bits[word] & (1u64 << bit)) != 0
+    }
+
+    fn apply_lock(&mut self, id: usize) {
+        let word = (id * 2) / 64;
+        let bit = (id * 2) % 64;
+        self.locked_bits[word] |= 1u64 << bit;
+        self.current_hash ^= self.zobrist_lock[id];
+        let Edge(u, v) = self.all_edges[id];
+        self.locked_degree[u] += 1;
+        self.locked_degree[v] += 1;
+        self.undo_stack.push(Change::Lock(id));
+    }
+
+    fn apply_delete(&mut self, id: usize) {
+        let word = (id * 2 + 1) / 64;
+        let bit = (id * 2 + 1) % 64;
+        self.deleted_bits[word] |= 1u64 << bit;
+        self.current_hash ^= self.zobrist_delete[id];
+        self.undo_stack.push(Change::Delete(id));
+
+        let Edge(u, v) = self.all_edges[id];
+        if let Some(pos) = self.g_avail[u].iter().position(|&x| x == v) {
+            self.g_avail[u].swap_remove(pos);
+        }
+        if let Some(pos) = self.g_avail[v].iter().position(|&x| x == u) {
+            self.g_avail[v].swap_remove(pos);
+        }
+        self.graph_undo.push((u, v));
+        self.total_deletions += 1;
+    }
+
+    fn undo(&mut self) {
+        if let Some(ch) = self.undo_stack.pop() {
+            match ch {
+                Change::Lock(id) => {
+                    let word = (id * 2) / 64;
+                    let bit = (id * 2) % 64;
+                    self.locked_bits[word] &= !(1u64 << bit);
+                    self.current_hash ^= self.zobrist_lock[id];
+                    let Edge(u, v) = self.all_edges[id];
+                    self.locked_degree[u] -= 1;
+                    self.locked_degree[v] -= 1;
+                }
+                Change::Delete(id) => {
+                    let word = (id * 2 + 1) / 64;
+                    let bit = (id * 2 + 1) % 64;
+                    self.deleted_bits[word] &= !(1u64 << bit);
+                    self.current_hash ^= self.zobrist_delete[id];
+                    if let Some((u, v)) = self.graph_undo.pop() {
+                        self.g_avail[u].push(v);
+                        self.g_avail[v].push(u);
+                    }
+                    self.total_deletions -= 1;
+                }
+            }
+        }
+    }
+
+    fn undo_to(&mut self, target: usize) {
+        while self.undo_stack.len() > target {
+            self.undo();
+        }
+    }
+
+    fn memoize(&mut self, state: u64) {
+        self.memo_cache
+            .entry(state)
+            .or_insert_with(Vec::new)
+            .push((self.locked_bits.clone(), self.deleted_bits.clone()));
+    }
+
+    fn build_locked_graph(&self) -> Vec<Vec<usize>> {
+        let mut gl: Vec<Vec<usize>> = vec![vec![]; self.n];
         let m = self.all_edges.len();
-        let num_bits = m * 2;
-        let num_words = (num_bits + 63) / 64;
-        let mut key = vec![0u64; num_words];
-        for e in locked {
-            if let Some(&id) = self.edge_id.get(e) {
-                let bit_pos = id * 2;
-                let word = bit_pos / 64;
-                let bit = bit_pos % 64;
-                key[word] |= 1u64 << bit;
+        for id in 0..m {
+            if self.is_locked(id) {
+                let Edge(u, v) = self.all_edges[id];
+                gl[u].push(v);
+                gl[v].push(u);
             }
         }
-        for e in deleted {
-            if let Some(&id) = self.edge_id.get(e) {
-                let bit_pos = id * 2 + 1;
-                let word = bit_pos / 64;
-                let bit = bit_pos % 64;
-                key[word] |= 1u64 << bit;
+        gl
+    }
+
+    fn collect_locked(&self) -> Vec<Edge> {
+        let mut path = vec![];
+        let m = self.all_edges.len();
+        for id in 0..m {
+            if self.is_locked(id) {
+                path.push(self.all_edges[id]);
             }
         }
-        key
+        path
     }
 
     fn solve(&mut self) -> Option<Vec<Edge>> {
@@ -85,230 +201,213 @@ impl BcCraver {
         if self.has_bridges() {
             return None;
         }
-        let mut locked: HashSet<Edge> = HashSet::new();
-        let mut deleted: HashSet<Edge> = HashSet::new();
-        if self._search(&mut locked, &mut deleted) {
+
+        self.locked_bits.fill(0);
+        self.deleted_bits.fill(0);
+        self.current_hash = 0;
+        self.undo_stack.clear();
+        self.graph_undo.clear();
+        self.locked_degree.fill(0);
+        self.g_avail = self.g_orig.clone();
+        self.best_path = None;
+        self.total_deletions = 0;
+
+        if self._search() {
             return self.best_path.clone();
         }
         None
     }
 
-    fn get_memo_size(&self) -> usize {
-        self.memo_cache.len()
-    }
+    fn _search(&mut self) -> bool {
+        let state = self.current_hash;
 
-    fn _search(&mut self, locked: &mut HashSet<Edge>, deleted: &mut HashSet<Edge>) -> bool {
-        let state_sig = self._get_state_key(locked, deleted);
-        if self.memo_cache.contains(&state_sig) {
-            return false;
-        }
-
-        let mut g_avail = self.g_orig.clone();
-        for e in deleted.iter() {
-            let u = e.0;
-            let v = e.1;
-            g_avail[u].retain(|&x| x != v);
-            g_avail[v].retain(|&x| x != u);
-        }
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-
-            if g_avail.iter().any(|adj| adj.len() < 2) {
-                self.memo_cache.insert(state_sig.clone());
-                return false;
-            }
-
-            let aps = self.get_articulation_points(&g_avail);
-            for ap in aps {
-                let mut g_temp = g_avail.clone();
-                self.remove_node(&mut g_temp, ap);
-                if self.number_connected_components(&g_temp) > 2 {
-                    self.memo_cache.insert(state_sig.clone());
+        // Exact zero-collision verification (Zobrist is now only a fast pre-filter)
+        if let Some(entries) = self.memo_cache.get(&state) {
+            for (locked, deleted) in entries {
+                if locked == &self.locked_bits && deleted == &self.deleted_bits {
                     return false;
                 }
             }
+        }
 
-            let degree: Vec<usize> = g_avail.iter().map(|adj| adj.len()).collect();
-            let mut locked_degree: Vec<usize> = vec![0; self.n];
-            for e in locked.iter() {
-                locked_degree[e.0] += 1;
-                locked_degree[e.1] += 1;
-            }
-            let overloaded = locked_degree.iter().any(|&d| d > 2);
-            if overloaded {
-                self.memo_cache.insert(state_sig.clone());
+        let entry_len = self.undo_stack.len();
+        let mut last_ap_deletions = self.total_deletions;
+        let mut needs_ap_check = true;
+        let mut changed = true;
+
+        while changed {
+            changed = false;
+
+            if self.g_avail.iter().any(|adj| adj.len() < 2) {
+                self.undo_to(entry_len);
+                self.memoize(state);
                 return false;
             }
 
+            // Gatekeeper de Mutation: AP only if a deletion occurred since last scan
+            if needs_ap_check || self.total_deletions > last_ap_deletions {
+                let aps = self.get_articulation_points(&self.g_avail);
+                for ap in aps {
+                    let mut g_temp = self.g_avail.clone();
+                    self.remove_node(&mut g_temp, ap);
+                    if self.number_connected_components(&g_temp) > 2 {
+                        self.undo_to(entry_len);
+                        self.memoize(state);
+                        return false;
+                    }
+                }
+                last_ap_deletions = self.total_deletions;
+                needs_ap_check = false;
+            }
+
+            if self.locked_degree.iter().any(|&d| d > 2) {
+                self.undo_to(entry_len);
+                self.memoize(state);
+                return false;
+            }
+
+            let degree: Vec<usize> = self.g_avail.iter().map(|adj| adj.len()).collect();
             let mut locket_count: Vec<usize> = vec![0; self.n];
             for i in 0..self.n {
                 if degree[i] == 2 {
-                    for &v in &g_avail[i] {
+                    for &v in &self.g_avail[i] {
                         locket_count[v] += 1;
                     }
                 }
             }
             if locket_count.iter().any(|&c| c > 2) {
-                self.memo_cache.insert(state_sig.clone());
+                self.undo_to(entry_len);
+                self.memoize(state);
                 return false;
             }
 
-            for &node in &self.nodes {
-                let avail_edges = g_avail[node].clone();
+            for node in 0..self.n {
+                let avail_edges = self.g_avail[node].clone();
 
-                if avail_edges.len() == 2 && locked_degree[node] < 2 {
+                if avail_edges.len() == 2 && self.locked_degree[node] < 2 {
                     for &v in &avail_edges {
                         let e = Edge(min(node, v), max(node, v));
-                        if !locked.contains(&e) {
-                            locked.insert(e);
-                            changed = true;
+                        if let Some(&id) = self.edge_id.get(&e) {
+                            if !self.is_locked(id) {
+                                self.apply_lock(id);
+                                changed = true;
+                            }
                         }
                     }
                     if avail_edges.len() == 2 {
                         let m1 = avail_edges[0];
                         let m2 = avail_edges[1];
                         if m1 != m2 {
-                            let has_chord = g_avail[m1].iter().any(|&x| x == m2);
+                            let has_chord = self.g_avail[m1].iter().any(|&x| x == m2);
                             if has_chord {
                                 let e_chord = Edge(min(m1, m2), max(m1, m2));
-                                if !locked.contains(&e_chord) && !deleted.contains(&e_chord) {
-                                    deleted.insert(e_chord);
-                                    changed = true;
-                                    let u = e_chord.0;
-                                    let vv = e_chord.1;
-                                    g_avail[u].retain(|&x| x != vv);
-                                    g_avail[vv].retain(|&x| x != u);
+                                if let Some(&id) = self.edge_id.get(&e_chord) {
+                                    if !self.is_locked(id) && !self.is_deleted(id) {
+                                        self.apply_delete(id);
+                                        changed = true;
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                if locked_degree[node] == 2 && g_avail[node].len() > 2 {
-                    let current_neighbors: Vec<usize> = g_avail[node].clone();
-                    let mut to_delete = vec![];
+                if self.locked_degree[node] == 2 && self.g_avail[node].len() > 2 {
+                    let current_neighbors: Vec<usize> = self.g_avail[node].clone();
                     for &v in &current_neighbors {
                         let e = Edge(min(node, v), max(node, v));
-                        if !locked.contains(&e) {
-                            to_delete.push(v);
+                        if let Some(&id) = self.edge_id.get(&e) {
+                            if !self.is_locked(id) {
+                                self.apply_delete(id);
+                                changed = true;
+                            }
                         }
-                    }
-                    for &v in &to_delete {
-                        let e = Edge(min(node, v), max(node, v));
-                        deleted.insert(e);
-                        changed = true;
-                        g_avail[node].retain(|&x| x != v);
-                        g_avail[v].retain(|&x| x != node);
                     }
                 }
             }
 
-            if !locked.is_empty() {
-                let mut g_locked: Vec<Vec<usize>> = vec![vec![]; self.n];
-                for e in locked.iter() {
-                    g_locked[e.0].push(e.1);
-                    g_locked[e.1].push(e.0);
-                }
+            if self.undo_stack.len() > entry_len {
+                let g_locked = self.build_locked_graph();
                 if self.has_subcycle(&g_locked) {
-                    self.memo_cache.insert(state_sig.clone());
+                    self.undo_to(entry_len);
+                    self.memoize(state);
                     return false;
                 }
                 if self.is_full_cycle(&g_locked) {
-                    let path: Vec<Edge> = locked.iter().cloned().collect();
-                    self.best_path = Some(path);
+                    self.best_path = Some(self.collect_locked());
                     return true;
                 }
             }
         }
 
-        if locked.len() == self.n {
-            let mut g_locked: Vec<Vec<usize>> = vec![vec![]; self.n];
-            for e in locked.iter() {
-                g_locked[e.0].push(e.1);
-                g_locked[e.1].push(e.0);
-            }
+        if self.locked_degree.iter().all(|&d| d == 2) {
+            let g_locked = self.build_locked_graph();
             if self.is_connected(&g_locked) && self.all_degree2(&g_locked) {
-                let path: Vec<Edge> = locked.iter().cloned().collect();
-                self.best_path = Some(path);
+                self.best_path = Some(self.collect_locked());
                 return true;
             }
         }
 
-        let mut locked_degree = vec![0usize; self.n];
-        for e in locked.iter() {
-            locked_degree[e.0] += 1;
-            locked_degree[e.1] += 1;
-        }
-        let avail_deg: Vec<usize> = g_avail.iter().map(|adj| adj.len()).collect();
-
+        let avail_deg: Vec<usize> = self.g_avail.iter().map(|adj| adj.len()).collect();
         let mut available_edges: Vec<Edge> = vec![];
         for u in 0..self.n {
-            for &v in &g_avail[u] {
+            for &v in &self.g_avail[u] {
                 if u < v {
                     let e = Edge(u, v);
-                    if !locked.contains(&e) {
-                        available_edges.push(e);
+                    if let Some(&id) = self.edge_id.get(&e) {
+                        if !self.is_locked(id) {
+                            available_edges.push(e);
+                        }
                     }
                 }
             }
         }
 
         if available_edges.is_empty() {
-            self.memo_cache.insert(state_sig.clone());
+            self.undo_to(entry_len);
+            self.memoize(state);
             return false;
         }
 
         available_edges.sort_by(|ea, eb| {
-            let (u1, v1) = (ea.0, ea.1);
-            let (u2, v2) = (eb.0, eb.1);
-            let sum1 = locked_degree[u1] + locked_degree[v1];
-            let sum2 = locked_degree[u2] + locked_degree[v2];
-            let force1 = (if locked_degree[u1] == 1 { avail_deg[u1].saturating_sub(2) } else { 0 })
-                + (if locked_degree[v1] == 1 { avail_deg[v1].saturating_sub(2) } else { 0 });
-            let force2 = (if locked_degree[u2] == 1 { avail_deg[u2].saturating_sub(2) } else { 0 })
-                + (if locked_degree[v2] == 1 { avail_deg[v2].saturating_sub(2) } else { 0 });
-            let score1 = (sum1 as u32) * 100 + (force1 as u32);
-            let score2 = (sum2 as u32) * 100 + (force2 as u32);
+            let sum1 = self.locked_degree[ea.0] + self.locked_degree[ea.1];
+            let sum2 = self.locked_degree[eb.0] + self.locked_degree[eb.1];
+            let force1 = (if self.locked_degree[ea.0] == 1 { avail_deg[ea.0].saturating_sub(2) } else { 0 })
+                + (if self.locked_degree[ea.1] == 1 { avail_deg[ea.1].saturating_sub(2) } else { 0 });
+            let force2 = (if self.locked_degree[eb.0] == 1 { avail_deg[eb.0].saturating_sub(2) } else { 0 })
+                + (if self.locked_degree[eb.1] == 1 { avail_deg[eb.1].saturating_sub(2) } else { 0 });
+            let score1 = (sum1 as u32) * 100 + force1 as u32;
+            let score2 = (sum2 as u32) * 100 + force2 as u32;
             score2.cmp(&score1)
         });
 
         let guess_edge = available_edges[0];
-
-        {
-            let mut locked1 = locked.clone();
-            locked1.insert(guess_edge);
-            let mut deleted1 = deleted.clone();
-            if self._search(&mut locked1, &mut deleted1) {
-                *locked = locked1;
-                *deleted = deleted1;
+        if let Some(&id) = self.edge_id.get(&guess_edge) {
+            self.apply_lock(id);
+            if self._search() {
                 return true;
             }
+            self.undo();
         }
-
-        {
-            let mut locked2 = locked.clone();
-            let mut deleted2 = deleted.clone();
-            deleted2.insert(guess_edge);
-            if self._search(&mut locked2, &mut deleted2) {
-                *locked = locked2;
-                *deleted = deleted2;
+        if let Some(&id) = self.edge_id.get(&guess_edge) {
+            self.apply_delete(id);
+            if self._search() {
                 return true;
             }
+            self.undo();
         }
 
-        self.memo_cache.insert(state_sig);
+        self.undo_to(entry_len);
+        self.memoize(state);
         false
     }
 
+    // ==================== ALL HELPERS (unchanged from previous version) ====================
     fn is_bipartite(&self) -> bool {
         let mut color: Vec<i32> = vec![-1; self.n];
         for i in 0..self.n {
-            if color[i] == -1 {
-                if !self.bfs_color(i, &mut color) {
-                    return false;
-                }
+            if color[i] == -1 && !self.bfs_color(i, &mut color) {
+                return false;
             }
         }
         true
@@ -328,8 +427,7 @@ impl BcCraver {
         let mut q: VecDeque<usize> = VecDeque::new();
         q.push_back(start);
         color[start] = 0;
-        while !q.is_empty() {
-            let u = q.pop_front().unwrap();
+        while let Some(u) = q.pop_front() {
             for &v in &self.g_orig[u] {
                 if color[v] == -1 {
                     color[v] = 1 - color[u];
@@ -347,11 +445,11 @@ impl BcCraver {
     }
 
     fn get_bridges(&self, g: &Vec<Vec<usize>>) -> Vec<Edge> {
-        let mut disc: Vec<i32> = vec![-1; self.n];
-        let mut low: Vec<i32> = vec![-1; self.n];
-        let mut parent: Vec<i32> = vec![-1; self.n];
+        let mut disc = vec![-1i32; self.n];
+        let mut low = vec![-1i32; self.n];
+        let mut parent = vec![-1i32; self.n];
         let mut time_stamp = 0;
-        let mut bridges: Vec<Edge> = vec![];
+        let mut bridges = vec![];
         for i in 0..self.n {
             if disc[i] == -1 {
                 self.dfs_bridges(i, g, &mut disc, &mut low, &mut parent, &mut time_stamp, &mut bridges);
@@ -379,7 +477,7 @@ impl BcCraver {
     }
 
     fn is_connected(&self, g: &Vec<Vec<usize>>) -> bool {
-        let mut visited: Vec<bool> = vec![false; self.n];
+        let mut visited = vec![false; self.n];
         self.dfs(0, g, &mut visited);
         visited.iter().all(|&v| v)
     }
@@ -394,7 +492,7 @@ impl BcCraver {
     }
 
     fn number_connected_components(&self, g: &Vec<Vec<usize>>) -> usize {
-        let mut visited: Vec<bool> = vec![false; self.n];
+        let mut visited = vec![false; self.n];
         let mut count = 0;
         for i in 0..self.n {
             if !visited[i] {
@@ -413,23 +511,17 @@ impl BcCraver {
     }
 
     fn get_articulation_points(&self, g: &Vec<Vec<usize>>) -> Vec<usize> {
-        let mut disc: Vec<i32> = vec![-1; self.n];
-        let mut low: Vec<i32> = vec![-1; self.n];
-        let mut parent: Vec<i32> = vec![-1; self.n];
-        let mut ap: Vec<bool> = vec![false; self.n];
+        let mut disc = vec![-1i32; self.n];
+        let mut low = vec![-1i32; self.n];
+        let mut parent = vec![-1i32; self.n];
+        let mut ap = vec![false; self.n];
         let mut time_stamp = 0;
         for i in 0..self.n {
             if disc[i] == -1 {
                 self.dfs_ap(i, g, &mut disc, &mut low, &mut parent, &mut time_stamp, &mut ap);
             }
         }
-        let mut aps: Vec<usize> = vec![];
-        for i in 0..self.n {
-            if ap[i] {
-                aps.push(i);
-            }
-        }
-        aps
+        (0..self.n).filter(|&i| ap[i]).collect()
     }
 
     fn dfs_ap(&self, u: usize, g: &Vec<Vec<usize>>, disc: &mut Vec<i32>, low: &mut Vec<i32>, parent: &mut Vec<i32>, time_stamp: &mut i32, ap: &mut Vec<bool>) {
@@ -456,20 +548,13 @@ impl BcCraver {
     }
 
     fn has_subcycle(&self, g_locked: &Vec<Vec<usize>>) -> bool {
-        let mut visited: Vec<bool> = vec![false; self.n];
+        let mut visited = vec![false; self.n];
         for i in 0..self.n {
             if !visited[i] {
-                let mut component: Vec<usize> = vec![];
+                let mut component = vec![];
                 self.dfs_component(i, g_locked, &mut visited, &mut component);
                 let comp_size = component.len();
-                let mut is_cycle = true;
-                for &u in &component {
-                    if g_locked[u].len() != 2 {
-                        is_cycle = false;
-                        break;
-                    }
-                }
-                if is_cycle && comp_size < self.n {
+                if component.iter().all(|&u| g_locked[u].len() == 2) && comp_size < self.n {
                     return true;
                 }
             }
@@ -478,10 +563,7 @@ impl BcCraver {
     }
 
     fn is_full_cycle(&self, g_locked: &Vec<Vec<usize>>) -> bool {
-        if !self.is_connected(g_locked) {
-            return false;
-        }
-        self.all_degree2(g_locked)
+        self.is_connected(g_locked) && self.all_degree2(g_locked)
     }
 
     fn dfs_component(&self, u: usize, g: &Vec<Vec<usize>>, visited: &mut Vec<bool>, component: &mut Vec<usize>) {
@@ -495,67 +577,59 @@ impl BcCraver {
     }
 
     fn all_degree2(&self, g: &Vec<Vec<usize>>) -> bool {
-        for i in 0..self.n {
-            if g[i].len() != 2 {
-                return false;
-            }
-        }
-        true
+        g.iter().all(|adj| adj.len() == 2)
+    }
+
+    fn get_memo_size(&self) -> usize {
+        self.memo_cache.len()
     }
 }
 
+// ====================== FREE HELPERS ======================
 fn validate_cycle(g: &Vec<Vec<usize>>, path_edges: &Option<Vec<Edge>>) -> bool {
-    if let Some(edges) = path_edges {
-        if edges.len() != g.len() {
-            return false;
-        }
-        let n = g.len();
-        let mut g_res: Vec<Vec<usize>> = vec![vec![]; n];
-        for e in edges {
-            g_res[e.0].push(e.1);
-            g_res[e.1].push(e.0);
-        }
-        if !all_degree2(&g_res, n) {
-            return false;
-        }
-        if !is_connected(&g_res, n) {
-            return false;
-        }
-        true
-    } else {
-        false
+    let Some(edges) = path_edges else { return false; };
+    if edges.len() != g.len() {
+        return false;
     }
+    let n = g.len();
+    let mut g_res: Vec<Vec<usize>> = vec![vec![]; n];
+    for e in edges {
+        g_res[e.0].push(e.1);
+        g_res[e.1].push(e.0);
+    }
+    all_degree2_free(&g_res, n) && is_connected_free(&g_res, n)
 }
 
-fn all_degree2(g: &Vec<Vec<usize>>, n: usize) -> bool {
-    for i in 0..n {
-        if g[i].len() != 2 {
-            return false;
-        }
-    }
-    true
+fn all_degree2_free(g: &Vec<Vec<usize>>, _n: usize) -> bool {
+    g.iter().all(|adj| adj.len() == 2)
 }
 
-fn is_connected(g: &Vec<Vec<usize>>, n: usize) -> bool {
-    let mut visited: Vec<bool> = vec![false; n];
-    dfs(0, g, &mut visited);
+fn is_connected_free(g: &Vec<Vec<usize>>, n: usize) -> bool {
+    let mut visited = vec![false; n];
+    dfs_free(0, g, &mut visited);
     visited.iter().all(|&v| v)
 }
 
-fn dfs(u: usize, g: &Vec<Vec<usize>>, visited: &mut Vec<bool>) {
+fn dfs_free(u: usize, g: &Vec<Vec<usize>>, visited: &mut Vec<bool>) {
     visited[u] = true;
     for &v in &g[u] {
         if !visited[v] {
-            dfs(v, g, visited);
+            dfs_free(v, g, visited);
         }
     }
 }
 
+// ====================== ALL GRAPH GENERATORS ======================
 fn get_tutte_graph() -> Vec<Vec<usize>> {
     let n = 46;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; n];
+    let mut g = vec![vec![]; n];
     let edges = vec![
-        (0,1), (0,2), (0,3), (1,4), (1,26), (2,10), (2,11), (3,18), (3,19), (4,5), (4,33), (5,6), (5,29), (6,7), (6,27), (7,8), (7,14), (8,9), (8,38), (9,10), (9,37), (10,39), (11,12), (11,39), (12,13), (12,35), (13,14), (13,15), (14,34), (15,16), (15,22), (16,17), (16,44), (17,18), (17,43), (18,45), (19,20), (19,45), (20,21), (20,41), (21,22), (21,23), (22,40), (23,24), (23,27), (24,25), (24,32), (25,26), (25,31), (26,33), (27,28), (28,29), (28,32), (29,30), (30,31), (30,33), (31,32), (34,35), (34,38), (35,36), (36,37), (36,39), (37,38), (40,41), (40,44), (41,42), (42,43), (42,45), (43,44)
+        (0,1),(0,2),(0,3),(1,4),(1,26),(2,10),(2,11),(3,18),(3,19),(4,5),(4,33),(5,6),(5,29),
+        (6,7),(6,27),(7,8),(7,14),(8,9),(8,38),(9,10),(9,37),(10,39),(11,12),(11,39),(12,13),
+        (12,35),(13,14),(13,15),(14,34),(15,16),(15,22),(16,17),(16,44),(17,18),(17,43),(18,45),
+        (19,20),(19,45),(20,21),(20,41),(21,22),(21,23),(22,40),(23,24),(23,27),(24,25),(24,32),
+        (25,26),(25,31),(26,33),(27,28),(28,29),(28,32),(29,30),(30,31),(30,33),(31,32),(34,35),
+        (34,38),(35,36),(36,37),(36,39),(37,38),(40,41),(40,44),(41,42),(42,43),(42,45),(43,44),
     ];
     for &(u, v) in &edges {
         g[u].push(v);
@@ -566,9 +640,10 @@ fn get_tutte_graph() -> Vec<Vec<usize>> {
 
 fn get_petersen_graph() -> Vec<Vec<usize>> {
     let n = 10;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; n];
+    let mut g = vec![vec![]; n];
     let edges = vec![
-        (0,1), (1,2), (2,3), (3,4), (4,0), (5,7), (7,9), (9,6), (6,8), (8,5), (0,5), (1,6), (2,7), (3,8), (4,9)
+        (0,1),(1,2),(2,3),(3,4),(4,0),(5,7),(7,9),(9,6),(6,8),(8,5),
+        (0,5),(1,6),(2,7),(3,8),(4,9),
     ];
     for &(u, v) in &edges {
         g[u].push(v);
@@ -579,9 +654,15 @@ fn get_petersen_graph() -> Vec<Vec<usize>> {
 
 fn get_heawood_graph() -> Vec<Vec<usize>> {
     let n = 14;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; n];
+    let mut g = vec![vec![]; n];
     let lines: Vec<Vec<usize>> = vec![
-        vec![0,1,2], vec![0,3,5], vec![0,4,6], vec![1,3,6], vec![1,4,5], vec![2,3,4], vec![2,5,6]
+        vec![0,1,2],
+        vec![0,3,5],
+        vec![0,4,6],
+        vec![1,3,6],
+        vec![1,4,5],
+        vec![2,3,4],
+        vec![2,5,6],
     ];
     for l in 0..7 {
         for &p in &lines[l] {
@@ -595,9 +676,11 @@ fn get_heawood_graph() -> Vec<Vec<usize>> {
 
 fn get_desargues_graph() -> Vec<Vec<usize>> {
     let n = 20;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; n];
+    let mut g = vec![vec![]; n];
     let edges = vec![
-        (0,1), (0,5), (0,19), (1,2), (1,16), (2,3), (2,11), (3,4), (3,14), (4,5), (4,9), (5,6), (6,7), (6,15), (7,8), (7,18), (8,9), (8,13), (9,10), (10,11), (10,19), (11,12), (12,13), (12,17), (13,14), (14,15), (15,16), (16,17), (17,18), (18,19)
+        (0,1),(0,5),(0,19),(1,2),(1,16),(2,3),(2,11),(3,4),(3,14),(4,5),(4,9),(5,6),(6,7),
+        (6,15),(7,8),(7,18),(8,9),(8,13),(9,10),(10,11),(10,19),(11,12),(12,13),(12,17),
+        (13,14),(14,15),(15,16),(16,17),(17,18),(18,19),
     ];
     for &(u, v) in &edges {
         g[u].push(v);
@@ -608,8 +691,12 @@ fn get_desargues_graph() -> Vec<Vec<usize>> {
 
 fn get_dodecahedral_graph() -> Vec<Vec<usize>> {
     let n = 20;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; n];
-    let adjs = vec![1,4,7, 0,2,9, 1,3,11, 2,3,13, 0,3,5, 4,6,14, 5,7,16, 0,6,8, 7,9,17, 1,8,10, 9,11,18, 2,10,12, 11,13,19, 3,12,14, 5,13,15, 14,16,19, 6,15,17, 8,16,18, 10,17,19, 12,15,18];
+    let mut g = vec![vec![]; n];
+    let adjs = vec![
+        1,4,7, 0,2,9, 1,3,11, 2,3,13, 0,3,5, 4,6,14, 5,7,16, 0,6,8,
+        7,9,17, 1,8,10, 9,11,18, 2,10,12, 11,13,19, 3,12,14, 5,13,15,
+        14,16,19, 6,15,17, 8,16,18, 10,17,19, 12,15,18,
+    ];
     for i in 0..20 {
         for j in 0..3 {
             let v = adjs[i * 3 + j];
@@ -621,11 +708,10 @@ fn get_dodecahedral_graph() -> Vec<Vec<usize>> {
 
 fn get_hypercube_graph(dim: usize) -> Vec<Vec<usize>> {
     let nn = 1 << dim;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 0..nn {
         for j in 0..dim {
-            let neigh = i ^ (1 << j);
-            g[i].push(neigh);
+            g[i].push(i ^ (1 << j));
         }
     }
     g
@@ -633,7 +719,7 @@ fn get_hypercube_graph(dim: usize) -> Vec<Vec<usize>> {
 
 fn get_grid_graph(rows: usize, cols: usize) -> Vec<Vec<usize>> {
     let nn = rows * cols;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 0..rows {
         for j in 0..cols {
             let u = i * cols + j;
@@ -653,7 +739,7 @@ fn get_grid_graph(rows: usize, cols: usize) -> Vec<Vec<usize>> {
 }
 
 fn get_complete_graph(nn: usize) -> Vec<Vec<usize>> {
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 0..nn {
         for j in i + 1..nn {
             g[i].push(j);
@@ -664,7 +750,7 @@ fn get_complete_graph(nn: usize) -> Vec<Vec<usize>> {
 }
 
 fn get_wheel_graph(nn: usize) -> Vec<Vec<usize>> {
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 1..nn {
         g[0].push(i);
         g[i].push(0);
@@ -680,7 +766,7 @@ fn get_wheel_graph(nn: usize) -> Vec<Vec<usize>> {
 
 fn get_circular_ladder_graph(k: usize) -> Vec<Vec<usize>> {
     let nn = 2 * k;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 0..k {
         let next = (i + 1) % k;
         g[i].push(next);
@@ -697,7 +783,7 @@ fn get_circular_ladder_graph(k: usize) -> Vec<Vec<usize>> {
 
 fn get_complete_bipartite(a: usize, b: usize) -> Vec<Vec<usize>> {
     let nn = a + b;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 0..a {
         for j in 0..b {
             let v = j + a;
@@ -710,7 +796,7 @@ fn get_complete_bipartite(a: usize, b: usize) -> Vec<Vec<usize>> {
 
 fn get_star_graph(k: usize) -> Vec<Vec<usize>> {
     let nn = k + 1;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 1..=k {
         g[0].push(i);
         g[i].push(0);
@@ -720,7 +806,7 @@ fn get_star_graph(k: usize) -> Vec<Vec<usize>> {
 
 fn get_barbell_graph(m1: usize, _m2: usize) -> Vec<Vec<usize>> {
     let nn = 2 * m1;
-    let mut g: Vec<Vec<usize>> = vec![vec![]; nn];
+    let mut g = vec![vec![]; nn];
     for i in 0..m1 {
         for j in i + 1..m1 {
             g[i].push(j);
@@ -738,8 +824,39 @@ fn get_barbell_graph(m1: usize, _m2: usize) -> Vec<Vec<usize>> {
     g
 }
 
+// NEW: Knight's Tour graph generator (Cavalier)
+fn get_knight_graph(rows: usize, cols: usize) -> Vec<Vec<usize>> {
+    let deltas: [(isize, isize); 8] = [
+        (-2, -1),
+        (-2, 1),
+        (-1, -2),
+        (-1, 2),
+        (1, -2),
+        (1, 2),
+        (2, -1),
+        (2, 1),
+    ];
+    let n = rows * cols;
+    let mut g: Vec<Vec<usize>> = vec![vec![]; n];
+    for r in 0..rows {
+        for c in 0..cols {
+            let u = r * cols + c;
+            for &(dr, dc) in &deltas {
+                let nr = r as isize + dr;
+                let nc = c as isize + dc;
+                if nr >= 0 && nr < rows as isize && nc >= 0 && nc < cols as isize {
+                    let v = (nr as usize) * cols + (nc as usize);
+                    g[u].push(v);
+                }
+            }
+        }
+    }
+    g
+}
+
+// ====================== TEST FUNCTIONS ======================
 fn verify_carver_integrity() {
-    println!("{:<25} | {:<5} | {:<10} | {:<10} | Time (s)", "Adversarial Case", "N", "Expected", "Result");
+    println!("{:<30} | {:<5} | {:<10} | {:<10} | Time (s)", "Adversarial Case", "N", "Expected", "Result");
     println!("{}", "-".repeat(80));
     let test_matrix: Vec<(String, fn() -> Vec<Vec<usize>>, String)> = vec![
         ("Petersen (UNSAT)".to_string(), get_petersen_graph, "UNSAT".to_string()),
@@ -756,6 +873,7 @@ fn verify_carver_integrity() {
         ("Star Graph S(8) (UNSAT)".to_string(), || get_star_graph(8), "UNSAT".to_string()),
         ("7x7 Grid (UNSAT)".to_string(), || get_grid_graph(7, 7), "UNSAT".to_string()),
         ("Barbell B(8,0) (UNSAT)".to_string(), || get_barbell_graph(8, 0), "UNSAT".to_string()),
+        ("5x5 Knight (UNSAT)".to_string(), || get_knight_graph(5, 5), "UNSAT".to_string()),
     ];
     for (name, maker, expected) in test_matrix {
         let g = maker();
@@ -766,11 +884,17 @@ fn verify_carver_integrity() {
         let duration = start.elapsed().as_secs_f64();
         let result = if path.is_some() { "SAT" } else { "UNSAT" };
         let status = if result == "SAT" {
-            if validate_cycle(&g, &path) { "✅ PASS" } else { "❌ INVALID PATH" }
+            if validate_cycle(&g, &path) {
+                "✅ PASS"
+            } else {
+                "❌ INVALID PATH"
+            }
+        } else if expected == "UNSAT" {
+            "✅ PASS"
         } else {
-            if expected == "UNSAT" { "✅ PASS" } else { "❌ FALSE UNSAT" }
+            "❌ FALSE UNSAT"
         };
-        println!("{:<25} | {:<5} | {:<10} | {:<10} | {:.5} {}", name, n, expected, result, duration, status);
+        println!("{:<30} | {:<5} | {:<10} | {:<10} | {:.5} {}", name, n, expected, result, duration, status);
     }
 }
 
@@ -800,9 +924,9 @@ fn run_bulletproof_audit(max_n: usize) {
         let mut status = String::new();
         for _ in 0..3 {
             let p_hard = ((nn as f64).ln() + ((nn as f64).ln().ln() + 1e-9)) / (nn as f64);
-            let p_test = p_hard;
+            let p_test = p_hard.max(0.15);
             let mut g = get_random_graph(nn, p_test);
-            while !is_connected(&g, nn) {
+            while !is_connected_free(&g, nn) {
                 g = get_random_graph(nn, p_test);
             }
             let mut solver = BcCraver::new(&g);
