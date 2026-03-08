@@ -1,4 +1,4 @@
-# BCcarver — Hamiltonian Cycle Solver
+# Ben Chiboub carver — Hamiltonian Cycle Solver
 
 A fast, exact Hamiltonian cycle solver written in Rust. Built from first principles — the pruning rules were derived independently with pen and paper through experiment and intuition, then implemented with AI assistance, though I don't claim inventing many of those rules, it happens that I just rediscovered them. No prior knowledge of graph theory or Rust was assumed. It helped me learn many concepts of graph theory and Hamiltonean cycles, and perhaps the creation of a capable efficient solver.
 
@@ -208,4 +208,5 @@ The solver is not the fastest in the world. State-of-the-art approaches using li
 ## Author
 
 [@mrkinix](https://github.com/mrkinix)
+Hédi Ben Chiboub
 
