@@ -1,4 +1,5 @@
-# BCcarver — Hamiltonian Cycle Solver
+# BCcarver v6 — Hamiltonian Cycle Solver (Parallel Edition)
+> BCcarver is an experimental research project exploring constraint-propagation approaches to the Hamiltonian Cycle problem.
 
 **Author:** Hédi Ben Chiboub ([@mrkinix](https://github.com/mrkinix))
 
@@ -6,7 +7,7 @@ A fast, exact Hamiltonian cycle solver written in Rust. The pruning rules were d
 
 Many of the rules I arrived at turn out to exist in some form in the literature. I don't claim to have invented all of them. What I claim is that I rediscovered them independently, combined them in a specific way, added rules of my own, and built something that works at a level I didn't expect when I started.
 
-**20/20 adversarial suite. N=1000 in ~18s. N=1500 in ~55s. N=2000 in ~128s. Cache hits: single digits to low tens. Zero timeouts on dense random graphs up to N=2000.**
+**20/20 adversarial suite. N=1000 in ~17.6s. N=2000 in ~127s. Cache hits: single digits to low tens. Zero timeouts on dense random graphs up to N=2000 (N=3000 hits 300s timeout).**
 
 ---
 
@@ -16,14 +17,55 @@ A Hamiltonian cycle is a closed path through a graph that visits every node exac
 
 ---
 
-## Algorithm
+## Algorithm & Parallelism
 
 The solver is a **constraint-propagation / backtracking** engine. Every edge is in one of three states: *available*, *locked* (must be in the cycle), or *deleted* (cannot be in the cycle). Propagation rules fire exhaustively before each branch, collapsing the search space. Branching is a last resort.
+
+## Solver Pipeline
+
+Each solve follows the same deterministic pipeline:
+
+1. **Pre-filters**
+   - Bridge detection (Tarjan)
+   - Bipartite parity check
+
+2. **Constraint Propagation**
+   Apply propagation rules exhaustively until a fixed point:
+   - Degree-2 forcing
+   - Chord deletion
+   - Saturation
+   - Locked-count constraint
+   - Subcycle detection
+   - Endpoint connectivity
+   - BC rules
+
+3. **Branch Selection**
+   Select a decision edge using the MRV + Fail-First heuristic.
+
+4. **Branching**
+   Create two branches:
+   - lock(edge)
+   - delete(edge)
+
+5. **Recursive Solve**
+   Propagate again and repeat.
+
+6. **Parallel Execution**
+   Initial branch tree is split to depth *d* (default 4) and subtrees are solved concurrently using Rayon.
+
+7. **Termination**
+   - A Hamiltonian cycle covering all vertices ⇒ **SAT**
+   - All branches inconsistent ⇒ **UNSAT**
+     
+
+**v6 Parallel Strategy:**
+
+Single instance solving utilizes parallel tree splitting. The solver runs initial propagation once, enumerates branch decisions to a specific split depth (default 4, producing up to 16 independent subtrees), and solves them concurrently on the thread pool. First SAT wins; all must report UNSAT for global UNSAT.
 
 ### Propagation Rules
 
 | Rule | Description |
-|------|-------------|
+|-----|-------------|
 | **Degree-2 forcing** | A node with only 2 available edges must use both — lock them |
 | **Chord deletion** | When two forced neighbours are adjacent, their shared edge would create a premature subcycle — delete it |
 | **Saturation** | A node with 2 locked edges is done — delete all remaining available edges at that node |
@@ -33,149 +75,210 @@ The solver is a **constraint-propagation / backtracking** engine. Every edge is 
 | **Path endpoint connectivity** | The two open ends of the partial locked path must be able to reach each other through available edges — else prune |
 | **Degree-3 near-forcing** | One-step lookahead: if locking an edge would starve a neighbour below degree 2 via saturation cascade — delete it |
 
-### Ben-Chiboub Rules (BC-1, BC-2, BC-3)
+---
 
-Three structural rules derived independently, specifically effective on cubic and near-cubic graphs:
+## Ben-Chiboub Rules (BC-1, BC-2, BC-3)
 
-**BC-1 — Diamond chain forcing:** In a 5-node cluster where two interior nodes each have exactly one external connection, the bypass edge between them is always unused — delete it, and force the external connections. Reduces branching on cubic substructures that appear constantly in FHCP-class graphs.
+Three structural rules derived independently, specifically effective on cubic and near-cubic graphs.
 
-**BC-2 — Ladder rung forcing:** In a ladder-structured section (two parallel chains connected by rungs, each rung node with degree 3), the rungs are forced. Lock the rung, delete the rail chord that would create a short-circuit.
+### BC-1 — Diamond Chain Forcing
 
-**BC-3 — Square fourth-edge deletion:** If exactly 3 of 4 edges forming a 4-cycle are locked, the 4th must be deleted — locking it would complete a subcycle. Applied proactively, before the subcycle check catches it after the fact.
+In a 5-node cluster where two interior nodes each have exactly one external connection, the bypass edge between them is always unused. Delete it and force the external connections.
 
-### Branch Variable Selection
+This reduces branching on cubic substructures that appear frequently in FHCP-class graphs.
 
-**MRV + Fail-First:** Find the most constrained node — minimum available degree, maximum locked degree — using the packed key `avail_deg * 4 - locked_degree`. Among its incident edges, prefer the one whose other endpoint is most committed. The solver commits to the hardest decisions first, failing fast on dead ends.
+### BC-2 — Ladder Rung Forcing
 
-### Pre-Filters (O(n+m), run once before search)
+In a ladder structure (two parallel chains connected by rungs, each rung node with degree 3), the rungs are forced.
 
-- **Bridge detection** — iterative Tarjan; any bridge means UNSAT immediately
-- **Bipartite parity** — unequal partition sizes means UNSAT immediately
+Lock the rung and delete the rail chord that would create a short circuit.
 
-### Memoization
+### BC-3 — Square Fourth-Edge Deletion
 
-Dead-end states are stored keyed by the exact `(locked_bits, deleted_bits)` pair — not a hash, the full state. Collision-free. Low cache counts in benchmarks (typically under 30 even at N=2000) show how rarely the solver revisits states: propagation resolves most of the problem before branching is needed.
+If exactly 3 of 4 edges forming a 4-cycle are locked, the 4th must be deleted. Locking it would complete a premature subcycle.
+
+Applied proactively before the subcycle check catches it.
 
 ---
 
-## Performance
+## Branch Variable Selection
 
-### Adversarial Suite — 20/20 ✅
+**MRV + Fail-First heuristic**
 
-```
-Graph                            | N     | Expected | Result | Time(s)  | Status
----------------------------------|-------|----------|--------|----------|--------
-Petersen (UNSAT)                 | 10    | UNSAT    | UNSAT  | 0.00062  | ✅ PASS
-Tutte (UNSAT)                    | 46    | UNSAT    | UNSAT  | 0.17308  | ✅ PASS
-8x8 Grid (SAT)                   | 64    | SAT      | SAT    | 0.01246  | ✅ PASS
-Heawood (SAT)                    | 14    | SAT      | SAT    | 0.00051  | ✅ PASS
-Hypercube Q4 (SAT)               | 16    | SAT      | SAT    | 0.00097  | ✅ PASS
-Dodecahedral (SAT)               | 20    | SAT      | SAT    | 0.00101  | ✅ PASS
-Desargues (SAT)                  | 20    | SAT      | SAT    | 0.00115  | ✅ PASS
-Complete K15 (SAT)               | 15    | SAT      | SAT    | 0.00149  | ✅ PASS
-Wheel W20 (SAT)                  | 20    | SAT      | SAT    | 0.00220  | ✅ PASS
-Circular Ladder 10 (SAT)         | 20    | SAT      | SAT    | 0.00057  | ✅ PASS
-Bipartite K5,6 (UNSAT)           | 11    | UNSAT    | UNSAT  | 0.00001  | ✅ PASS
-Star S8 (UNSAT)                  | 9     | UNSAT    | UNSAT  | 0.00000  | ✅ PASS
-7x7 Grid (UNSAT)                 | 49    | UNSAT    | UNSAT  | 0.00003  | ✅ PASS
-Barbell B8 (UNSAT)               | 16    | UNSAT    | UNSAT  | 0.00002  | ✅ PASS
-5x5 Knight (UNSAT)               | 25    | UNSAT    | UNSAT  | 0.00002  | ✅ PASS
-10x10 Grid (SAT)                 | 100   | SAT      | SAT    | 0.03575  | ✅ PASS
-11x11 Grid (UNSAT)               | 121   | UNSAT    | UNSAT  | 0.00007  | ✅ PASS
-Hypercube Q5 (SAT)               | 32    | SAT      | SAT    | 0.00387  | ✅ PASS
-Complete K20 (SAT)               | 20    | SAT      | SAT    | 0.00273  | ✅ PASS
-Circular Ladder 30 (SAT)         | 60    | SAT      | SAT    | 0.00339  | ✅ PASS
-```
-
-### Dense Random Graphs — p = 0.08 (Phase-Transition Density)
-
-p = 0.08 is the hardest density for large random graphs — roughly half are Hamiltonian, half are not. No structural shortcuts. Every instance requires real search.
-
-The cache column is the number of memoized dead ends. These numbers tell the real story: the solver is not exploring large search trees. It's propagating its way to the answer.
+Find the most constrained node using the packed priority key:
 
 ```
-N     | Edges   | Time (s) | Cache hits
-------|---------|----------|------------
-500   | ~9,800  | 3.5      | ~10
-1000  | ~40,200 | 17.3     | ~15
-1500  | 90,063  | 54.6     | 24
-2000  | 160,376 | 128.5    | 28
+avail_deg * 4 - locked_degree
 ```
 
-Zero timeouts. The full N=1000–1099 run, 100 consecutive graphs, zero failures:
+Among its incident edges, prefer the edge whose other endpoint is most committed.
+
+The solver intentionally commits to the hardest decisions first, causing dead branches to collapse quickly.
+
+---
+
+## Pre-Filters (O(n + m), executed before search)
+
+- **Bridge detection** — iterative Tarjan algorithm; any bridge implies immediate UNSAT
+- **Bipartite parity** — unequal partition sizes imply UNSAT
+
+---
+
+## Memoization
+
+Dead-end states are stored keyed by the exact `(locked_bits, deleted_bits)` pair.
+
+This is not a hash approximation — the full state is stored, so collisions cannot occur.
+
+Benchmark results show very low cache counts (often below 30 even for N=2000), indicating that most of the search space collapses via propagation before branching occurs.
+
+---
+
+# Performance
+
+## Adversarial Suite — 20/20
+
+Run on **BCcarver v6 — 8 threads (split depth = 4).**
 
 ```
-N     | Edges  | Time(s) | Cache | N     | Edges  | Time(s) | Cache
-------|--------|---------|-------|-------|--------|---------|------
-1000  | 40156  | 17.32   | 18    | 1050  | 43728  | 20.04   | 17
-1010  | 40364  | 17.34   | 14    | 1060  | 44960  | 20.73   | 16
-1020  | 41588  | 19.63   | 13    | 1070  | 45707  | 21.21   | 13
-1030  | 42582  | 19.30   | 14    | 1080  | 46964  | 21.79   | 7
-1040  | 43097  | 19.71   | 17    | 1099  | 48129  | 22.37   | 17
+Graph                            | N     | Expected   | Result     | Time(s)   | Status
+-----------------------------------------------------------------------------------------
+Petersen (UNSAT)                 | 10    | UNSAT      | UNSAT      | 0.00065   | PASS
+Tutte (UNSAT)                    | 46    | UNSAT      | UNSAT      | 0.17651   | PASS
+8x8 Grid (SAT)                   | 64    | SAT        | SAT        | 0.01268   | PASS
+Heawood (SAT)                    | 14    | SAT        | SAT        | 0.00047   | PASS
+Hypercube Q4 (SAT)               | 16    | SAT        | SAT        | 0.00078   | PASS
+Dodecahedral (SAT)               | 20    | SAT        | SAT        | 0.00098   | PASS
+Desargues (SAT)                  | 20    | SAT        | SAT        | 0.00095   | PASS
+Complete K15 (SAT)               | 15    | SAT        | SAT        | 0.00162   | PASS
+Wheel W20 (SAT)                  | 20    | SAT        | SAT        | 0.00220   | PASS
+Circular Ladder 10 (SAT)         | 20    | SAT        | SAT        | 0.00073   | PASS
+Bipartite K5,6 (UNSAT)           | 11    | UNSAT      | UNSAT      | 0.00003   | PASS
+Star S8 (UNSAT)                  | 9     | UNSAT      | UNSAT      | 0.00001   | PASS
+7x7 Grid (UNSAT)                 | 49    | UNSAT      | UNSAT      | 0.00003   | PASS
+Barbell B8 (UNSAT)               | 16    | UNSAT      | UNSAT      | 0.00002   | PASS
+5x5 Knight (UNSAT)               | 25    | UNSAT      | UNSAT      | 0.00002   | PASS
+10x10 Grid (SAT)                 | 100   | SAT        | SAT        | 0.03521   | PASS
+11x11 Grid (UNSAT)               | 121   | UNSAT      | UNSAT      | 0.00007   | PASS
+Hypercube Q5 (SAT)               | 32    | SAT        | SAT        | 0.00360   | PASS
+Complete K20 (SAT)               | 20    | SAT        | SAT        | 0.00270   | PASS
+Circular Ladder 30 (SAT)         | 60    | SAT        | SAT        | 0.00278   | PASS
 ```
 
 ---
 
-## Usage
+## Dense Random Graphs — Phase Transition (p = 0.08)
+
+Density around **p ≈ 0.08** is one of the hardest regimes for random graphs.
+
+Approximately half of the graphs are Hamiltonian and half are not, meaning the solver cannot rely on structural shortcuts and must perform genuine search.
+
+```
+N     | Edges   | Time(s)   | Cache | p      | Status
+-------------------------------------------------------
+500   | ~10k    | ~2.6      | ~10   | 0.0800 | Solved
+1000  | ~40k    | ~17.7     | ~16   | 0.0800 | Solved
+2000  | ~160k   | ~127.4    | ~25   | 0.0800 | Solved
+3000  | 359k    | 300.1     | 22    | 0.0800 | Timeout
+```
+
+---
+
+# Usage
+
+### Cargo.toml
 
 ```toml
-# Cargo.toml
 [dependencies]
-rand = "0.8"
+rand  = "0.8"
+rayon = "1.8"
 
 [profile.release]
 opt-level = 3
 ```
 
+### Commands
+
+Run built-in benchmark suite:
+
 ```bash
-# Built-in adversarial suite + random audit
 cargo run --release
+```
 
-# Solve a single .hcp file
+Solve a single `.hcp` file:
+
+```bash
 cargo run --release -- instance.hcp
+```
 
-# Run full FHCP benchmark directory (120s timeout per instance)
+Run FHCP benchmark directory:
+
+```bash
 cargo run --release -- --fhcp ./fhcp_instances/ 120
+```
 
-# Random graph audit: start_n end_n p
+Random graph audit:
+
+```bash
 cargo run --release -- --random 1000 2000 0.08
+```
+
+Override thread count:
+
+```bash
+cargo run --release -- --threads 8
 ```
 
 ---
 
-## FHCP Benchmark
+# FHCP Benchmark
 
-The solver supports the [Flinders Hamiltonian Cycle Problem benchmark](http://www.flinders.edu.au/science_engineering/csem/research/programs/flinders-hamiltonian-cycle-project/) — 1001 structured instances used to compare HC solvers in research. The HCP parser handles both `EDGE_LIST` and `ADJ_LIST` formats.
+BCcarver supports the **Flinders Hamiltonian Cycle Problem benchmark (FHCP)**:
 
-Note: FHCP instances are mostly sparse cubic graphs (degree 3), which are a different hard case from dense random graphs. BCcarver handles small-to-medium FHCP instances well. Large sparse cubic instances (N > 500) are the open challenge that am working on.
+http://www.flinders.edu.au/science_engineering/csem/research/programs/flinders-hamiltonian-cycle-project/
 
----
+This dataset contains **1001 structured Hamiltonian cycle instances** commonly used in academic research.
 
-## Background
+The parser supports both:
 
-I started this knowing nothing about graph theory and having never written Rust. I wanted to work on something genuinely hard — not a tutorial project. The Hamiltonian cycle problem is NP-complete. I picked it.
+- `EDGE_LIST`
+- `ADJ_LIST`
 
-The approach: study the problem structure, understand why a cycle can or cannot exist, derive rules that encode that understanding. Pen and paper. A lot of trial and error. Then implement with AI handling the Rust syntax while I directed the algorithm.
-
-Many rules I arrived at independently exist in published literature. I didn't know that when I derived them. The BC rules and some implementation choices I haven't found in papers, though I make no strong novelty claims without a full literature survey.
-
-What I can say: the combination works. N=2000 in 128 seconds with 28 cache hits on an NP-complete problem is not what I expected when I started.
-
-BCcarver is named after me because it's mine. Not because I think I invented constraint propagation.
+Most FHCP instances are **sparse cubic graphs (degree 3)**, which represent a different class of difficulty than dense random graphs.
 
 ---
 
-## Limitations (working on it)
+# Background
 
-- Single-threaded
-- No LP relaxation — pure combinatorial search
-- Sparse cubic graphs (FHCP hard instances, N > 500) remain challenging
-- Memory scales with memoization table on adversarial inputs
+This project started as an experiment.
+
+No prior knowledge of graph theory.  
+No Rust experience.  
+Just curiosity about a difficult problem.
+
+The workflow was simple:
+
+1. Study the structure of Hamiltonian cycles
+2. Derive rules explaining when cycles must or cannot exist
+3. Encode those rules as propagation constraints
+4. Implement them in Rust
+
+The result was a solver that performs far better than expected for a first attempt.
+
+The name **BCcarver** reflects the idea of carving the solution space down with structural rules.
 
 ---
 
-## Author
+# Limitations
 
-**Hédi Ben Chiboub** — [@mrkinix](https://github.com/mrkinix)
+- Large sparse cubic graphs (FHCP hard instances above ~500 nodes) remain difficult
+- Memoization tables may grow large on pathological inputs
 
-CS dropout. First Rust project. First graph theory project. Built a competitive exact solver for an NP-complete problem with pen and paper and stubbornness.
+---
+
+# Author
+
+**Hédi Ben Chiboub**  
+GitHub: https://github.com/mrkinix
+
+CS dropout. First Rust project. First graph theory project. Built an exact solver for an NP-complete problem using intuition, experimentation, and persistence.
