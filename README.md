@@ -1,6 +1,6 @@
 # BCcarver — Hamiltonian Cycle Solver
 
-A fast, exact Hamiltonian cycle solver written in Rust. Built from first principles — the pruning rules were derived independently with pen and paper through experiment and intuition, then implemented with AI assistance, though I don't claim inventing many of those rules, it happens that I just rediscovered them. No prior knowledge of graph theory or Rust was assumed.
+A fast, exact Hamiltonian cycle solver written in Rust. Built from first principles — the pruning rules were derived independently with pen and paper through experiment and intuition, then implemented with AI assistance, though I don't claim inventing many of those rules, it happens that I just rediscovered them. No prior knowledge of graph theory or Rust was assumed. It helped me learn many concepts of graph theory and Hamiltonean cycles, and perhaps the creation of a capable efficient solver.
 
 **20/20 on adversarial test suite. Solves N=500 sparse random graphs (p=0.08) in ~3.5 seconds consistently.**
 
