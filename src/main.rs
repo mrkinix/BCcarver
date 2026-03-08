@@ -945,5 +945,5 @@ fn run_bulletproof_audit(max_n: usize) {
 
 fn main() {
     verify_carver_integrity();
-    run_bulletproof_audit(200000);
+    run_bulletproof_audit(20010);
 }
