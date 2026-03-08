@@ -15,19 +15,18 @@ enum Change {
 
 struct BcCraver {
     n: usize,
-    nodes: Vec<usize>,
     g_orig: Vec<Vec<usize>>,
-    memo_cache: HashMap<u64, Vec<(Vec<u64>, Vec<u64>)>>,
+    memo_cache: HashMap<(Vec<u64>, Vec<u64>), ()>,
     best_path: Option<Vec<Edge>>,
     all_edges: Vec<Edge>,
     edge_id: HashMap<Edge, usize>,
+    // Adjacency list per node: node -> list of edge ids (not neighbour ids)
+    // Used for O(deg) iteration without rebuilding adj lists
+    node_edges: Vec<Vec<usize>>,
     locked_bits: Vec<u64>,
     deleted_bits: Vec<u64>,
-    current_hash: u64,
     undo_stack: Vec<Change>,
     locked_degree: Vec<usize>,
-    zobrist_lock: Vec<u64>,
-    zobrist_delete: Vec<u64>,
     total_deletions: usize,
     words: usize,
     g_avail_bits: Vec<Vec<u64>>,
@@ -37,9 +36,8 @@ struct BcCraver {
 }
 
 impl BcCraver {
-    fn new(g: &Vec<Vec<usize>>) -> Self {
+    fn new(g: &[Vec<usize>]) -> Self {
         let n = g.len();
-        let nodes: Vec<usize> = (0..n).collect();
 
         let mut edge_set: HashSet<Edge> = HashSet::new();
         for u in 0..n {
@@ -57,12 +55,11 @@ impl BcCraver {
         let m = all_edges.len();
         let num_words = (m * 2 + 63) / 64;
 
-        let mut rng = thread_rng();
-        let mut zobrist_lock = vec![0u64; m];
-        let mut zobrist_delete = vec![0u64; m];
-        for i in 0..m {
-            zobrist_lock[i] = rng.r#gen::<u64>();
-            zobrist_delete[i] = rng.r#gen::<u64>();
+        // Build per-node edge-id lists for O(deg) traversal
+        let mut node_edges: Vec<Vec<usize>> = vec![vec![]; n];
+        for (id, &Edge(u, v)) in all_edges.iter().enumerate() {
+            node_edges[u].push(id);
+            node_edges[v].push(id);
         }
 
         let words = (n + 63) / 64;
@@ -83,19 +80,16 @@ impl BcCraver {
 
         BcCraver {
             n,
-            nodes,
-            g_orig: g.clone(),
+            g_orig: g.to_vec(),
             memo_cache: HashMap::new(),
             best_path: None,
             all_edges,
             edge_id,
+            node_edges,
             locked_bits: vec![0u64; num_words],
             deleted_bits: vec![0u64; num_words],
-            current_hash: 0,
             undo_stack: vec![],
             locked_degree: vec![0; n],
-            zobrist_lock,
-            zobrist_delete,
             total_deletions: 0,
             words,
             g_avail_bits,
@@ -105,29 +99,36 @@ impl BcCraver {
         }
     }
 
+    #[inline]
     fn is_locked(&self, id: usize) -> bool {
         let word = (id * 2) / 64;
         let bit = (id * 2) % 64;
         (self.locked_bits[word] & (1u64 << bit)) != 0
     }
 
+    #[inline]
     fn is_deleted(&self, id: usize) -> bool {
         let word = (id * 2 + 1) / 64;
         let bit = (id * 2 + 1) % 64;
         (self.deleted_bits[word] & (1u64 << bit)) != 0
     }
 
+    #[inline]
+    fn is_active(&self, id: usize) -> bool {
+        !self.is_locked(id) && !self.is_deleted(id)
+    }
+
     fn apply_lock(&mut self, id: usize) {
         let word = (id * 2) / 64;
         let bit = (id * 2) % 64;
         self.locked_bits[word] |= 1u64 << bit;
-        self.current_hash ^= self.zobrist_lock[id];
         let Edge(u, v) = self.all_edges[id];
         self.locked_degree[u] += 1;
         self.locked_degree[v] += 1;
         self.undo_stack.push(Change::Lock(id));
     }
 
+    #[inline]
     fn clear_bit(&mut self, u: usize, v: usize) {
         let w = v / 64;
         let b = v % 64;
@@ -136,6 +137,7 @@ impl BcCraver {
         }
     }
 
+    #[inline]
     fn set_bit(&mut self, u: usize, v: usize) {
         let w = v / 64;
         let b = v % 64;
@@ -148,7 +150,6 @@ impl BcCraver {
         let word = (id * 2 + 1) / 64;
         let bit = (id * 2 + 1) % 64;
         self.deleted_bits[word] |= 1u64 << bit;
-        self.current_hash ^= self.zobrist_delete[id];
         self.undo_stack.push(Change::Delete(id));
 
         let Edge(u, v) = self.all_edges[id];
@@ -166,7 +167,6 @@ impl BcCraver {
                     let word = (id * 2) / 64;
                     let bit = (id * 2) % 64;
                     self.locked_bits[word] &= !(1u64 << bit);
-                    self.current_hash ^= self.zobrist_lock[id];
                     let Edge(u, v) = self.all_edges[id];
                     self.locked_degree[u] -= 1;
                     self.locked_degree[v] -= 1;
@@ -175,7 +175,6 @@ impl BcCraver {
                     let word = (id * 2 + 1) / 64;
                     let bit = (id * 2 + 1) % 64;
                     self.deleted_bits[word] &= !(1u64 << bit);
-                    self.current_hash ^= self.zobrist_delete[id];
                     let Edge(u, v) = self.all_edges[id];
                     self.set_bit(u, v);
                     self.set_bit(v, u);
@@ -193,19 +192,15 @@ impl BcCraver {
         }
     }
 
-    fn memoize(&mut self, state: u64) {
-        self.memo_cache
-            .entry(state)
-            .or_insert_with(Vec::new)
-            .push((self.locked_bits.clone(), self.deleted_bits.clone()));
+    fn memoize(&mut self) {
+        let key = (self.locked_bits.clone(), self.deleted_bits.clone());
+        self.memo_cache.insert(key, ());
     }
 
     fn build_locked_graph(&self) -> Vec<Vec<usize>> {
         let mut gl: Vec<Vec<usize>> = vec![vec![]; self.n];
-        let m = self.all_edges.len();
-        for id in 0..m {
+        for (id, &Edge(u, v)) in self.all_edges.iter().enumerate() {
             if self.is_locked(id) {
-                let Edge(u, v) = self.all_edges[id];
                 gl[u].push(v);
                 gl[v].push(u);
             }
@@ -214,20 +209,15 @@ impl BcCraver {
     }
 
     fn collect_locked(&self) -> Vec<Edge> {
-        let mut path = vec![];
-        let m = self.all_edges.len();
-        for id in 0..m {
-            if self.is_locked(id) {
-                path.push(self.all_edges[id]);
-            }
-        }
-        path
+        self.all_edges.iter().enumerate()
+            .filter(|&(id, _)| self.is_locked(id))
+            .map(|(_, &e)| e)
+            .collect()
     }
 
+    #[inline]
     fn has_edge(&self, u: usize, v: usize) -> bool {
-        if v >= self.n {
-            return false;
-        }
+        if v >= self.n { return false; }
         let w = v / 64;
         let b = v % 64;
         (self.g_avail_bits[u][w] & (1u64 << b)) != 0
@@ -250,14 +240,11 @@ impl BcCraver {
     }
 
     fn build_avail_adj(&self) -> Vec<Vec<usize>> {
-        let mut adj = vec![vec![]; self.n];
-        for u in 0..self.n {
-            adj[u] = self.get_avail_neighbors(u);
-        }
-        adj
+        (0..self.n).map(|u| self.get_avail_neighbors(u)).collect()
     }
 
     fn solve(&mut self) -> Option<Vec<Edge>> {
+        // Fast pre-checks before any search
         if self.is_bipartite() {
             let color = self.get_color();
             let even = color.iter().filter(|&&c| c == 0).count();
@@ -270,15 +257,16 @@ impl BcCraver {
             return None;
         }
 
+        // Reset state
         self.locked_bits.fill(0);
         self.deleted_bits.fill(0);
-        self.current_hash = 0;
         self.undo_stack.clear();
         self.locked_degree.fill(0);
-        self.g_avail_bits = self.orig_bits.clone();
-        self.avail_deg = self.orig_deg.clone();
+        self.g_avail_bits.clone_from(&self.orig_bits);
+        self.avail_deg.clone_from(&self.orig_deg);
         self.best_path = None;
         self.total_deletions = 0;
+        self.memo_cache.clear();
 
         if self._search() {
             return self.best_path.clone();
@@ -286,53 +274,47 @@ impl BcCraver {
         None
     }
 
-    fn _search(&mut self) -> bool {
-        let state = self.current_hash;
-
-        if let Some(entries) = self.memo_cache.get(&state) {
-            for (locked, deleted) in entries {
-                if locked == &self.locked_bits && deleted == &self.deleted_bits {
-                    return false;
-                }
-            }
-        }
-
-        let entry_len = self.undo_stack.len();
-        let mut last_ap_deletions = self.total_deletions;
-        let mut needs_ap_check = true;
+    // ===================== FORCED PROPAGATION =====================
+    // Returns false if a contradiction was found (and undoes to entry_len).
+    // Returns true if propagation completed without contradiction.
+    // Sets self.best_path and returns true if a full cycle was found.
+    fn do_forced_propagation(&mut self, entry_len: usize) -> PropResult {
+        let mut last_ap_deletions = usize::MAX; // force AP check first iteration
         let mut changed = true;
 
         while changed {
             changed = false;
 
+            // --- Rule 1: any node with avail_deg < 2 is a dead end ---
             if self.avail_deg.iter().any(|&d| d < 2) {
                 self.undo_to(entry_len);
-                self.memoize(state);
-                return false;
+                return PropResult::Contradiction;
             }
 
-            if needs_ap_check || self.total_deletions > last_ap_deletions {
-                let current_adj = self.build_avail_adj();
-                let aps = self.get_articulation_points(&current_adj);
-                for ap in aps {
-                    let mut g_temp = current_adj.clone();
-                    self.remove_node(&mut g_temp, ap);
-                    if self.number_connected_components(&g_temp) > 1 {  // FIXED: >1 (true 2-connectivity prune)
-                        self.undo_to(entry_len);
-                        self.memoize(state);
-                        return false;
-                    }
-                }
-                last_ap_deletions = self.total_deletions;
-                needs_ap_check = false;
-            }
-
+            // --- Rule 2: locked_degree > 2 is invalid ---
             if self.locked_degree.iter().any(|&d| d > 2) {
                 self.undo_to(entry_len);
-                self.memoize(state);
-                return false;
+                return PropResult::Contradiction;
             }
 
+            // --- Rule 3: 2-connectivity of available graph ---
+            // Only recheck when deletions happened since last check
+            if self.total_deletions != last_ap_deletions {
+                let current_adj = self.build_avail_adj();
+                if self.number_connected_components(&current_adj) > 1 {
+                    self.undo_to(entry_len);
+                    return PropResult::Contradiction;
+                }
+                if !self.get_articulation_points(&current_adj).is_empty() {
+                    self.undo_to(entry_len);
+                    return PropResult::Contradiction;
+                }
+                last_ap_deletions = self.total_deletions;
+            }
+
+            // --- Rule 4: locket_count constraint ---
+            // A node v that appears as a neighbour of too many degree-2 nodes
+            // would need more than 2 locked edges → contradiction.
             let mut locket_count: Vec<usize> = vec![0; self.n];
             for i in 0..self.n {
                 if self.avail_deg[i] == 2 {
@@ -344,11 +326,12 @@ impl BcCraver {
             }
             if locket_count.iter().any(|&c| c > 2) {
                 self.undo_to(entry_len);
-                self.memoize(state);
-                return false;
+                return PropResult::Contradiction;
             }
 
+            // --- Rule 5: degree-2 forcing + chord deletion + saturation ---
             for node in 0..self.n {
+                // Force both edges if avail_deg == 2 and not yet fully locked
                 if self.avail_deg[node] == 2 && self.locked_degree[node] < 2 {
                     let neigh = self.get_avail_neighbors(node);
                     for &v in &neigh {
@@ -360,6 +343,7 @@ impl BcCraver {
                             }
                         }
                     }
+                    // Delete the chord between the two neighbours (would create subcycle)
                     if neigh.len() == 2 {
                         let m1 = neigh[0];
                         let m2 = neigh[1];
@@ -375,34 +359,100 @@ impl BcCraver {
                     }
                 }
 
+                // Saturate: node already has 2 locked edges → delete all others
                 if self.locked_degree[node] == 2 && self.avail_deg[node] > 2 {
-                    let current_neighbors = self.get_avail_neighbors(node);
-                    for &v in &current_neighbors {
-                        let e = Edge(min(node, v), max(node, v));
-                        if let Some(&id) = self.edge_id.get(&e) {
-                            if !self.is_locked(id) {
-                                self.apply_delete(id);
-                                changed = true;
-                            }
-                        }
+                    // Collect ids first to avoid borrow issues
+                    let to_delete: Vec<usize> = self.node_edges[node].iter()
+                        .copied()
+                        .filter(|&id| self.is_active(id))
+                        .collect();
+                    for id in to_delete {
+                        self.apply_delete(id);
+                        changed = true;
                     }
                 }
             }
 
+            // --- Rule 6: subcycle / full-cycle detection ---
             if self.undo_stack.len() > entry_len {
                 let g_locked = self.build_locked_graph();
                 if self.has_subcycle(&g_locked) {
                     self.undo_to(entry_len);
-                    self.memoize(state);
-                    return false;
+                    return PropResult::Contradiction;
                 }
                 if self.is_full_cycle(&g_locked) {
                     self.best_path = Some(self.collect_locked());
-                    return true;
+                    return PropResult::Solved;
                 }
             }
         }
+        PropResult::Continue
+    }
 
+    // ===================== BRANCH VARIABLE SELECTION =====================
+    // MRV (Minimum Remaining Values): find the tightest node first.
+    // "Tightness" = avail_deg - (2 - locked_degree), i.e. how many free slots remain
+    // for how many available edges. The node with the smallest ratio is most constrained.
+    // Among edges touching that node, prefer the one whose other endpoint has the highest
+    // locked_degree (fail-first: resolve already-committed paths first).
+    fn select_branch_edge(&self) -> Option<usize> {
+        // Find the most-constrained node that still needs locked edges
+        // remaining_slots = 2 - locked_degree[node]  (how many more locks it needs)
+        // avail_deg[node] = how many edges it can still choose from
+        // We want: min avail_deg among nodes with locked_degree < 2 and avail_deg >= 2
+        let branch_node = (0..self.n)
+            .filter(|&v| self.locked_degree[v] < 2 && self.avail_deg[v] >= 2)
+            .min_by_key(|&v| {
+                // Primary: smallest avail_deg (most constrained — MRV)
+                // Secondary: largest locked_degree (prefer nodes already on a partial path)
+                // Pack both into a single key: (avail_deg * 4) - locked_degree
+                // so smaller avail_deg wins, ties broken by larger locked_degree
+                (self.avail_deg[v] * 4).saturating_sub(self.locked_degree[v])
+            })?;
+
+        // Among edges incident to branch_node, find the best one using fail-first:
+        // prefer the edge whose other endpoint has the highest locked_degree
+        // (that endpoint is most committed and benefits most from resolving this edge)
+        let best_id = self.node_edges[branch_node].iter()
+            .copied()
+            .filter(|&id| self.is_active(id))
+            .max_by_key(|&id| {
+                let Edge(u, v) = self.all_edges[id];
+                let other = if u == branch_node { v } else { u };
+                // Score: locked_degree of other endpoint * 100 + (avail_deg inversely)
+                // Higher locked_degree = more committed = resolve first
+                // Lower avail_deg of other end = tighter = prefer
+                let lock_score = self.locked_degree[other] * 100;
+                let tight_score = 50usize.saturating_sub(self.avail_deg[other]);
+                lock_score + tight_score
+            })?;
+
+        Some(best_id)
+    }
+
+    // ===================== MAIN SEARCH =====================
+    fn _search(&mut self) -> bool {
+        // Transposition table: exact-match check
+        let key = (self.locked_bits.clone(), self.deleted_bits.clone());
+        if self.memo_cache.contains_key(&key) {
+            return false;
+        }
+
+        let entry_len = self.undo_stack.len();
+
+        match self.do_forced_propagation(entry_len) {
+            PropResult::Contradiction => {
+                self.memoize();
+                return false;
+            }
+            PropResult::Solved => {
+                return true;
+            }
+            PropResult::Continue => {}
+        }
+
+        // Check if all nodes are already satisfied (shouldn't be needed after propagation
+        // but acts as a safety net)
         if self.locked_degree.iter().all(|&d| d == 2) {
             let g_locked = self.build_locked_graph();
             if self.is_connected(&g_locked) && self.all_degree2(&g_locked) {
@@ -411,55 +461,117 @@ impl BcCraver {
             }
         }
 
-        // OPTIMIZED: O(m) edge-list scan instead of O(N) bit scans → eliminates recomputation cost
-        let mut available_edges: Vec<Edge> = vec![];
-        let m = self.all_edges.len();
-        for id in 0..m {
-            if !self.is_locked(id) && !self.is_deleted(id) {
-                available_edges.push(self.all_edges[id]);
+        // Select branch edge via MRV + fail-first heuristic
+        let branch_id = match self.select_branch_edge() {
+            Some(id) => id,
+            None => {
+                // No active edges left but not solved
+                self.undo_to(entry_len);
+                self.memoize();
+                return false;
             }
-        }
+        };
 
-        if available_edges.is_empty() {
-            self.undo_to(entry_len);
-            self.memoize(state);
-            return false;
+        // Branch 1: lock this edge (include it in the cycle)
+        self.apply_lock(branch_id);
+        if self._search() {
+            return true;
         }
+        self.undo();
 
-        available_edges.sort_by(|ea, eb| {
-            let sum1 = self.locked_degree[ea.0] + self.locked_degree[ea.1];
-            let sum2 = self.locked_degree[eb.0] + self.locked_degree[eb.1];
-            let force1 = (if self.locked_degree[ea.0] == 1 { self.avail_deg[ea.0].saturating_sub(2) } else { 0 })
-                + (if self.locked_degree[ea.1] == 1 { self.avail_deg[ea.1].saturating_sub(2) } else { 0 });
-            let force2 = (if self.locked_degree[eb.0] == 1 { self.avail_deg[eb.0].saturating_sub(2) } else { 0 })
-                + (if self.locked_degree[eb.1] == 1 { self.avail_deg[eb.1].saturating_sub(2) } else { 0 });
-            let score1 = (sum1 as u32) * 100 + force1 as u32;
-            let score2 = (sum2 as u32) * 100 + force2 as u32;
-            score2.cmp(&score1)
-        });
-
-        let guess_edge = available_edges[0];
-        if let Some(&id) = self.edge_id.get(&guess_edge) {
-            self.apply_lock(id);
-            if self._search() {
-                return true;
-            }
-            self.undo();
+        // Branch 2: delete this edge (exclude it from the cycle)
+        self.apply_delete(branch_id);
+        if self._search() {
+            return true;
         }
-        if let Some(&id) = self.edge_id.get(&guess_edge) {
-            self.apply_delete(id);
-            if self._search() {
-                return true;
-            }
-            self.undo();
-        }
+        self.undo();
 
         self.undo_to(entry_len);
-        self.memoize(state);
+        self.memoize();
         false
     }
 
-    // ==================== ALL HELPERS (unchanged) ====================
+    // ===================== GRAPH HELPERS =====================
+
+    fn is_connected(&self, g: &[Vec<usize>]) -> bool {
+        if self.n == 0 { return true; }
+        let mut visited = vec![false; self.n];
+        let mut stack: Vec<usize> = vec![0];
+        visited[0] = true;
+        while let Some(u) = stack.pop() {
+            for &v in &g[u] {
+                if !visited[v] {
+                    visited[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        visited.iter().all(|&v| v)
+    }
+
+    fn number_connected_components(&self, g: &[Vec<usize>]) -> usize {
+        let mut visited = vec![false; self.n];
+        let mut count = 0;
+        for i in 0..self.n {
+            if !visited[i] {
+                count += 1;
+                let mut stack: Vec<usize> = vec![i];
+                visited[i] = true;
+                while let Some(u) = stack.pop() {
+                    for &v in &g[u] {
+                        if !visited[v] {
+                            visited[v] = true;
+                            stack.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn has_subcycle(&self, g_locked: &[Vec<usize>]) -> bool {
+        let mut visited = vec![false; self.n];
+        for i in 0..self.n {
+            if !visited[i] {
+                let mut component: Vec<usize> = vec![];
+                let mut stack: Vec<usize> = vec![i];
+                visited[i] = true;
+                component.push(i);
+                while let Some(curr) = stack.pop() {
+                    for &v in &g_locked[curr] {
+                        if !visited[v] {
+                            visited[v] = true;
+                            component.push(v);
+                            stack.push(v);
+                        }
+                    }
+                }
+                let comp_size = component.len();
+                // A subcycle: all nodes in this component have degree 2 in locked graph
+                // but the component doesn't span the whole graph
+                if comp_size < self.n && component.iter().all(|&u| g_locked[u].len() == 2) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn is_full_cycle(&self, g_locked: &[Vec<usize>]) -> bool {
+        self.is_connected(g_locked) && self.all_degree2(g_locked)
+    }
+
+    fn all_degree2(&self, g: &[Vec<usize>]) -> bool {
+        g.iter().all(|adj| adj.len() == 2)
+    }
+
+    fn get_memo_size(&self) -> usize {
+        self.memo_cache.len()
+    }
+
+    // ===================== BIPARTITE CHECK =====================
+
     fn is_bipartite(&self) -> bool {
         let mut color: Vec<i32> = vec![-1; self.n];
         for i in 0..self.n {
@@ -497,11 +609,13 @@ impl BcCraver {
         true
     }
 
+    // ===================== BRIDGE CHECK (recursive Tarjan — only called once on g_orig) =====================
+
     fn has_bridges(&self) -> bool {
         !self.get_bridges(&self.g_orig).is_empty()
     }
 
-    fn get_bridges(&self, g: &Vec<Vec<usize>>) -> Vec<Edge> {
+    fn get_bridges(&self, g: &[Vec<usize>]) -> Vec<Edge> {
         let mut disc = vec![-1i32; self.n];
         let mut low = vec![-1i32; self.n];
         let mut parent = vec![-1i32; self.n];
@@ -515,7 +629,11 @@ impl BcCraver {
         bridges
     }
 
-    fn dfs_bridges(&self, u: usize, g: &Vec<Vec<usize>>, disc: &mut Vec<i32>, low: &mut Vec<i32>, parent: &mut Vec<i32>, time_stamp: &mut i32, bridges: &mut Vec<Edge>) {
+    fn dfs_bridges(
+        &self, u: usize, g: &[Vec<usize>],
+        disc: &mut Vec<i32>, low: &mut Vec<i32>, parent: &mut Vec<i32>,
+        time_stamp: &mut i32, bridges: &mut Vec<Edge>,
+    ) {
         disc[u] = *time_stamp;
         low[u] = *time_stamp;
         *time_stamp += 1;
@@ -533,41 +651,12 @@ impl BcCraver {
         }
     }
 
-    fn is_connected(&self, g: &Vec<Vec<usize>>) -> bool {
-        let mut visited = vec![false; self.n];
-        self.dfs(0, g, &mut visited);
-        visited.iter().all(|&v| v)
-    }
+    // ===================== ARTICULATION POINTS (recursive Tarjan — called on available subgraph) =====================
+    // Note: for N≤20000 random graphs the available subgraph stays well-connected and
+    // recursion depth stays manageable. For adversarial chain graphs this could be deep,
+    // but the 2-connectivity prune fires immediately for such graphs.
 
-    fn dfs(&self, u: usize, g: &Vec<Vec<usize>>, visited: &mut Vec<bool>) {
-        visited[u] = true;
-        for &v in &g[u] {
-            if !visited[v] {
-                self.dfs(v, g, visited);
-            }
-        }
-    }
-
-    fn number_connected_components(&self, g: &Vec<Vec<usize>>) -> usize {
-        let mut visited = vec![false; self.n];
-        let mut count = 0;
-        for i in 0..self.n {
-            if !visited[i] {
-                self.dfs(i, g, &mut visited);
-                count += 1;
-            }
-        }
-        count
-    }
-
-    fn remove_node(&self, g: &mut Vec<Vec<usize>>, ap: usize) {
-        g[ap].clear();
-        for i in 0..self.n {
-            g[i].retain(|&x| x != ap);
-        }
-    }
-
-    fn get_articulation_points(&self, g: &Vec<Vec<usize>>) -> Vec<usize> {
+    fn get_articulation_points(&self, g: &[Vec<usize>]) -> Vec<usize> {
         let mut disc = vec![-1i32; self.n];
         let mut low = vec![-1i32; self.n];
         let mut parent = vec![-1i32; self.n];
@@ -581,7 +670,11 @@ impl BcCraver {
         (0..self.n).filter(|&i| ap[i]).collect()
     }
 
-    fn dfs_ap(&self, u: usize, g: &Vec<Vec<usize>>, disc: &mut Vec<i32>, low: &mut Vec<i32>, parent: &mut Vec<i32>, time_stamp: &mut i32, ap: &mut Vec<bool>) {
+    fn dfs_ap(
+        &self, u: usize, g: &[Vec<usize>],
+        disc: &mut Vec<i32>, low: &mut Vec<i32>, parent: &mut Vec<i32>,
+        time_stamp: &mut i32, ap: &mut Vec<bool>,
+    ) {
         let mut children = 0;
         disc[u] = *time_stamp;
         low[u] = *time_stamp;
@@ -603,47 +696,18 @@ impl BcCraver {
             }
         }
     }
-
-    fn has_subcycle(&self, g_locked: &Vec<Vec<usize>>) -> bool {
-        let mut visited = vec![false; self.n];
-        for i in 0..self.n {
-            if !visited[i] {
-                let mut component = vec![];
-                self.dfs_component(i, g_locked, &mut visited, &mut component);
-                let comp_size = component.len();
-                if component.iter().all(|&u| g_locked[u].len() == 2) && comp_size < self.n {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn is_full_cycle(&self, g_locked: &Vec<Vec<usize>>) -> bool {
-        self.is_connected(g_locked) && self.all_degree2(g_locked)
-    }
-
-    fn dfs_component(&self, u: usize, g: &Vec<Vec<usize>>, visited: &mut Vec<bool>, component: &mut Vec<usize>) {
-        visited[u] = true;
-        component.push(u);
-        for &v in &g[u] {
-            if !visited[v] {
-                self.dfs_component(v, g, visited, component);
-            }
-        }
-    }
-
-    fn all_degree2(&self, g: &Vec<Vec<usize>>) -> bool {
-        g.iter().all(|adj| adj.len() == 2)
-    }
-
-    fn get_memo_size(&self) -> usize {
-        self.memo_cache.len()
-    }
 }
 
-// ====================== FREE HELPERS ======================
-fn validate_cycle(g: &Vec<Vec<usize>>, path_edges: &Option<Vec<Edge>>) -> bool {
+// ===================== PROPAGATION RESULT =====================
+enum PropResult {
+    Continue,       // propagation done, no conclusion yet → branch
+    Contradiction,  // dead end → backtrack
+    Solved,         // full Hamiltonian cycle found
+}
+
+// ===================== FREE HELPERS =====================
+
+fn validate_cycle(g: &[Vec<usize>], path_edges: &Option<Vec<Edge>>) -> bool {
     let Some(edges) = path_edges else { return false; };
     if edges.len() != g.len() {
         return false;
@@ -654,29 +718,27 @@ fn validate_cycle(g: &Vec<Vec<usize>>, path_edges: &Option<Vec<Edge>>) -> bool {
         g_res[e.0].push(e.1);
         g_res[e.1].push(e.0);
     }
-    all_degree2_free(&g_res, n) && is_connected_free(&g_res, n)
+    g_res.iter().all(|adj| adj.len() == 2) && is_connected_free(&g_res, n)
 }
 
-fn all_degree2_free(g: &Vec<Vec<usize>>, _n: usize) -> bool {
-    g.iter().all(|adj| adj.len() == 2)
-}
-
-fn is_connected_free(g: &Vec<Vec<usize>>, n: usize) -> bool {
+fn is_connected_free(g: &[Vec<usize>], n: usize) -> bool {
+    if n == 0 { return true; }
     let mut visited = vec![false; n];
-    dfs_free(0, g, &mut visited);
+    let mut stack: Vec<usize> = vec![0];
+    visited[0] = true;
+    while let Some(curr) = stack.pop() {
+        for &v in &g[curr] {
+            if !visited[v] {
+                visited[v] = true;
+                stack.push(v);
+            }
+        }
+    }
     visited.iter().all(|&v| v)
 }
 
-fn dfs_free(u: usize, g: &Vec<Vec<usize>>, visited: &mut Vec<bool>) {
-    visited[u] = true;
-    for &v in &g[u] {
-        if !visited[v] {
-            dfs_free(v, g, visited);
-        }
-    }
-}
+// ===================== GRAPH GENERATORS =====================
 
-// ====================== ALL GRAPH GENERATORS ======================
 fn get_tutte_graph() -> Vec<Vec<usize>> {
     let n = 46;
     let mut g = vec![vec![]; n];
@@ -713,19 +775,14 @@ fn get_heawood_graph() -> Vec<Vec<usize>> {
     let n = 14;
     let mut g = vec![vec![]; n];
     let lines: Vec<Vec<usize>> = vec![
-        vec![0,1,2],
-        vec![0,3,5],
-        vec![0,4,6],
-        vec![1,3,6],
-        vec![1,4,5],
-        vec![2,3,4],
-        vec![2,5,6],
+        vec![0,1,2], vec![0,3,5], vec![0,4,6],
+        vec![1,3,6], vec![1,4,5], vec![2,3,4], vec![2,5,6],
     ];
-    for l in 0..7 {
-        for &p in &lines[l] {
-            let line = l + 7;
-            g[p].push(line);
-            g[line].push(p);
+    for (l, line_pts) in lines.iter().enumerate() {
+        for &p in line_pts {
+            let line_node = l + 7;
+            g[p].push(line_node);
+            g[line_node].push(p);
         }
     }
     g
@@ -749,7 +806,7 @@ fn get_desargues_graph() -> Vec<Vec<usize>> {
 fn get_dodecahedral_graph() -> Vec<Vec<usize>> {
     let n = 20;
     let mut g = vec![vec![]; n];
-    let adjs = vec![
+    let adjs = [
         1,4,7, 0,2,9, 1,3,11, 2,3,13, 0,3,5, 4,6,14, 5,7,16, 0,6,8,
         7,9,17, 1,8,10, 9,11,18, 2,10,12, 11,13,19, 3,12,14, 5,13,15,
         14,16,19, 6,15,17, 8,16,18, 10,17,19, 12,15,18,
@@ -861,7 +918,7 @@ fn get_star_graph(k: usize) -> Vec<Vec<usize>> {
     g
 }
 
-fn get_barbell_graph(m1: usize, _m2: usize) -> Vec<Vec<usize>> {
+fn get_barbell_graph(m1: usize) -> Vec<Vec<usize>> {
     let nn = 2 * m1;
     let mut g = vec![vec![]; nn];
     for i in 0..m1 {
@@ -883,14 +940,7 @@ fn get_barbell_graph(m1: usize, _m2: usize) -> Vec<Vec<usize>> {
 
 fn get_knight_graph(rows: usize, cols: usize) -> Vec<Vec<usize>> {
     let deltas: [(isize, isize); 8] = [
-        (-2, -1),
-        (-2, 1),
-        (-1, -2),
-        (-1, 2),
-        (1, -2),
-        (1, 2),
-        (2, -1),
-        (2, 1),
+        (-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1),
     ];
     let n = rows * cols;
     let mut g: Vec<Vec<usize>> = vec![vec![]; n];
@@ -910,28 +960,34 @@ fn get_knight_graph(rows: usize, cols: usize) -> Vec<Vec<usize>> {
     g
 }
 
-// ====================== TEST FUNCTIONS ======================
+// ===================== TEST FUNCTIONS =====================
+
 fn verify_carver_integrity() {
-    println!("{:<30} | {:<5} | {:<10} | {:<10} | Time (s)", "Adversarial Case", "N", "Expected", "Result");
+    println!(
+        "{:<30} | {:<5} | {:<10} | {:<10} | Time (s)",
+        "Adversarial Case", "N", "Expected", "Result"
+    );
     println!("{}", "-".repeat(80));
-    let test_matrix: Vec<(String, fn() -> Vec<Vec<usize>>, String)> = vec![
-        ("Petersen (UNSAT)".to_string(), get_petersen_graph, "UNSAT".to_string()),
-        ("Tutte Graph (UNSAT)".to_string(), get_tutte_graph, "UNSAT".to_string()),
-        ("8x8 Grid (SAT)".to_string(), || get_grid_graph(8, 8), "SAT".to_string()),
-        ("Heawood Graph (SAT)".to_string(), get_heawood_graph, "SAT".to_string()),
-        ("Hypercube Q4 (SAT)".to_string(), || get_hypercube_graph(4), "SAT".to_string()),
-        ("Dodecahedral (SAT)".to_string(), get_dodecahedral_graph, "SAT".to_string()),
-        ("Desargues (SAT)".to_string(), get_desargues_graph, "SAT".to_string()),
-        ("Complete K(15) (SAT)".to_string(), || get_complete_graph(15), "SAT".to_string()),
-        ("Wheel W(20) (SAT)".to_string(), || get_wheel_graph(20), "SAT".to_string()),
-        ("Circular Ladder (SAT)".to_string(), || get_circular_ladder_graph(10), "SAT".to_string()),
-        ("Bipartite K(5,6) (UNSAT)".to_string(), || get_complete_bipartite(5, 6), "UNSAT".to_string()),
-        ("Star Graph S(8) (UNSAT)".to_string(), || get_star_graph(8), "UNSAT".to_string()),
-        ("7x7 Grid (UNSAT)".to_string(), || get_grid_graph(7, 7), "UNSAT".to_string()),
-        ("Barbell B(8,0) (UNSAT)".to_string(), || get_barbell_graph(8, 0), "UNSAT".to_string()),
-        ("5x5 Knight (UNSAT)".to_string(), || get_knight_graph(5, 5), "UNSAT".to_string()),
+
+    let test_matrix: Vec<(String, Box<dyn Fn() -> Vec<Vec<usize>>>, String)> = vec![
+        ("Petersen (UNSAT)".into(),         Box::new(get_petersen_graph),                    "UNSAT".into()),
+        ("Tutte Graph (UNSAT)".into(),      Box::new(get_tutte_graph),                       "UNSAT".into()),
+        ("8x8 Grid (SAT)".into(),           Box::new(|| get_grid_graph(8, 8)),               "SAT".into()),
+        ("Heawood Graph (SAT)".into(),      Box::new(get_heawood_graph),                     "SAT".into()),
+        ("Hypercube Q4 (SAT)".into(),       Box::new(|| get_hypercube_graph(4)),             "SAT".into()),
+        ("Dodecahedral (SAT)".into(),       Box::new(get_dodecahedral_graph),                "SAT".into()),
+        ("Desargues (SAT)".into(),          Box::new(get_desargues_graph),                   "SAT".into()),
+        ("Complete K(15) (SAT)".into(),     Box::new(|| get_complete_graph(15)),             "SAT".into()),
+        ("Wheel W(20) (SAT)".into(),        Box::new(|| get_wheel_graph(20)),                "SAT".into()),
+        ("Circular Ladder (SAT)".into(),    Box::new(|| get_circular_ladder_graph(10)),      "SAT".into()),
+        ("Bipartite K(5,6) (UNSAT)".into(), Box::new(|| get_complete_bipartite(5, 6)),       "UNSAT".into()),
+        ("Star Graph S(8) (UNSAT)".into(),  Box::new(|| get_star_graph(8)),                  "UNSAT".into()),
+        ("7x7 Grid (UNSAT)".into(),         Box::new(|| get_grid_graph(7, 7)),               "UNSAT".into()),
+        ("Barbell B(8,0) (UNSAT)".into(),   Box::new(|| get_barbell_graph(8)),               "UNSAT".into()),
+        ("5x5 Knight (UNSAT)".into(),       Box::new(|| get_knight_graph(5, 5)),             "UNSAT".into()),
     ];
-    for (name, maker, expected) in test_matrix {
+
+    for (name, maker, expected) in &test_matrix {
         let g = maker();
         let n = g.len();
         let mut solver = BcCraver::new(&g);
@@ -940,17 +996,16 @@ fn verify_carver_integrity() {
         let duration = start.elapsed().as_secs_f64();
         let result = if path.is_some() { "SAT" } else { "UNSAT" };
         let status = if result == "SAT" {
-            if validate_cycle(&g, &path) {
-                "✅ PASS"
-            } else {
-                "❌ INVALID PATH"
-            }
+            if validate_cycle(&g, &path) { "✅ PASS" } else { "❌ INVALID PATH" }
         } else if expected == "UNSAT" {
             "✅ PASS"
         } else {
             "❌ FALSE UNSAT"
         };
-        println!("{:<30} | {:<5} | {:<10} | {:<10} | {:.5} {}", name, n, expected, result, duration, status);
+        println!(
+            "{:<30} | {:<5} | {:<10} | {:<10} | {:.5} {}",
+            name, n, expected, result, duration, status
+        );
     }
 }
 
@@ -969,37 +1024,39 @@ fn get_random_graph(nn: usize, p: f64) -> Vec<Vec<usize>> {
     g
 }
 
-fn run_bulletproof_audit(max_n: usize) {
-    let ns: Vec<usize> = (500..=max_n).collect();
-    println!("{:<5} | {:<7} | {:<10} | {:<12} | Status", "N", "Edges", "Time (s)", "Cache Hits");
-    println!("{}", "-".repeat(55));
-    for nn in ns {
-        let mut trial_times: Vec<f64> = vec![];
-        let mut cache_size = 0;
-        let mut edges_num = 0;
-        let mut status = String::new();
-        for _ in 0..1 {
-            let p_hard = ((nn as f64).ln() + ((nn as f64).ln().ln() + 1e-9)) / (nn as f64);
-            let p_test = p_hard.max(0.15);
-            let mut g = get_random_graph(nn, p_test);
-            while !is_connected_free(&g, nn) {
-                g = get_random_graph(nn, p_test);
-            }
-            let mut solver = BcCraver::new(&g);
-            let start = Instant::now();
-            let path = solver.solve();
-            let dur = start.elapsed().as_secs_f64();
-            trial_times.push(dur);
-            cache_size = solver.get_memo_size();
-            edges_num = g.iter().map(|adj| adj.len()).sum::<usize>() / 2;
-            status = if path.is_some() { "Solved".to_string() } else { "UNSAT".to_string() };
+fn run_bulletproof_audit(start_n: usize, max_n: usize) {
+    println!(
+        "{:<5} | {:<7} | {:<12} | {:<12} | Status",
+        "N", "Edges", "Time (s)", "Cache Hits"
+    );
+    println!("{}", "-".repeat(60));
+
+    for nn in start_n..=max_n {
+        let p_hard = ((nn as f64).ln() + ((nn as f64).ln().ln().max(0.0) + 1e-9)) / (nn as f64);
+        let p_test = p_hard.max(0.15);
+
+        let mut g = get_random_graph(nn, p_test);
+        while !is_connected_free(&g, nn) {
+            g = get_random_graph(nn, p_test);
         }
-        let avg_t = trial_times.iter().sum::<f64>() / 1.0;
-        println!("{:<5} | {:<7} | {:.5}     | {:<12} | {}", nn, edges_num, avg_t, cache_size, status);
+
+        let mut solver = BcCraver::new(&g);
+        let start = Instant::now();
+        let path = solver.solve();
+        let dur = start.elapsed().as_secs_f64();
+        let cache_size = solver.get_memo_size();
+        let edges_num: usize = g.iter().map(|adj| adj.len()).sum::<usize>() / 2;
+        let status = if path.is_some() { "Solved" } else { "UNSAT" };
+
+        println!(
+            "{:<5} | {:<7} | {:.5}       | {:<12} | {}",
+            nn, edges_num, dur, cache_size, status
+        );
     }
 }
 
 fn main() {
     verify_carver_integrity();
-    run_bulletproof_audit(20000);
+    println!();
+    run_bulletproof_audit(500, 20010);
 }
