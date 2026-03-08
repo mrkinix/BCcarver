@@ -1,5 +1,5 @@
 # BCcarver v6 — Hamiltonian Cycle Solver (Parallel Edition)
-> BCcarver is an experimental research project exploring constraint-propagation approaches to the Hamiltonian Cycle problem.
+> Ben-Chiboub Carver is an experimental research project exploring constraint-propagation approaches to the Hamiltonian Cycle problem.
 
 **Author:** Hédi Ben Chiboub ([@mrkinix](https://github.com/mrkinix))
 
